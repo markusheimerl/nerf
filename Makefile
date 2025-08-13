@@ -2,25 +2,15 @@ CC = clang
 CFLAGS = -O3 -march=native -ffast-math -Wall -Wextra
 LDFLAGS = -lm -flto -lpng -ljson-c
 
-ARCH ?= sm_87
-CUDAFLAGS = --cuda-gpu-arch=$(ARCH) -x cuda -Wno-unknown-cuda-version
-CUDALIBS = -L/usr/local/cuda/lib64 -lcudart -lcublas
+data.out: data.o
+	$(CC) data.o $(LDFLAGS) -o $@
 
-train.out: nerf.o train.o mlp/gpu/mlp.o
-	$(CC) nerf.o train.o mlp/gpu/mlp.o $(CUDALIBS) $(LDFLAGS) -o $@
+data.o: data.c
+	$(CC) $(CFLAGS) -c data.c -o $@
 
-nerf.o: nerf.c nerf.h
-	$(CC) $(CFLAGS) $(CUDAFLAGS) -c nerf.c -o $@
-
-train.o: train.c nerf.h
-	$(CC) $(CFLAGS) $(CUDAFLAGS) -c train.c -o $@
-
-mlp/gpu/mlp.o:
-	$(MAKE) -C mlp/gpu mlp.o
-
-run: train.out
-	@time ./train.out
+data: data.out
+	@time ./data.out
 
 clean:
-	rm -f *.out *.o *.bin rendered_image.png
+	rm -f *.out *.o *.csv
 	$(MAKE) -C mlp/gpu clean

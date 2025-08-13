@@ -54,4 +54,4 @@ dkms.conf
 # debug information files
 *.dwo
 
-rendered_image.png
+*.csv
