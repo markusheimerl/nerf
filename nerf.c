@@ -94,8 +94,8 @@ __global__ void generate_rays_kernel(float* rays_o, float* rays_d, int* pixel_co
     }
 }
 
-__global__ void sample_and_encode_kernel(float* rays_o, float* rays_d, float* encoded_pos,
-                                        float* z_vals, int num_rays) {
+__global__ void sample_points_kernel(float* rays_o, float* rays_d, float* positions,
+                                    float* z_vals, int num_rays) {
     int ray_idx = blockIdx.x;
     int sample_idx = threadIdx.x;
     
@@ -105,43 +105,14 @@ __global__ void sample_and_encode_kernel(float* rays_o, float* rays_d, float* en
         
         z_vals[global_idx] = t;
         
-        float x = rays_o[ray_idx*3 + 0] + t * rays_d[ray_idx*3 + 0];
-        float y = rays_o[ray_idx*3 + 1] + t * rays_d[ray_idx*3 + 1];
-        float z = rays_o[ray_idx*3 + 2] + t * rays_d[ray_idx*3 + 2];
-        
-        int out_idx = global_idx * 63;
-        
-        encoded_pos[out_idx++] = x;
-        for (int l = 0; l < 10; l++) {
-            float freq = powf(2.0f, l);
-            encoded_pos[out_idx++] = sinf(freq * PI * x);
-            encoded_pos[out_idx++] = cosf(freq * PI * x);
-        }
-        
-        encoded_pos[out_idx++] = y;
-        for (int l = 0; l < 10; l++) {
-            float freq = powf(2.0f, l);
-            encoded_pos[out_idx++] = sinf(freq * PI * y);
-            encoded_pos[out_idx++] = cosf(freq * PI * y);
-        }
-        
-        encoded_pos[out_idx++] = z;
-        for (int l = 0; l < 10; l++) {
-            float freq = powf(2.0f, l);
-            encoded_pos[out_idx++] = sinf(freq * PI * z);
-            encoded_pos[out_idx++] = cosf(freq * PI * z);
-        }
+        // Just store raw 3D coordinates (no positional encoding)
+        positions[global_idx * 3 + 0] = rays_o[ray_idx*3 + 0] + t * rays_d[ray_idx*3 + 0];
+        positions[global_idx * 3 + 1] = rays_o[ray_idx*3 + 1] + t * rays_d[ray_idx*3 + 1];
+        positions[global_idx * 3 + 2] = rays_o[ray_idx*3 + 2] + t * rays_d[ray_idx*3 + 2];
     }
 }
 
-__global__ void extract_density_kernel(float* mlp_output, float* density, int num_samples) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < num_samples) {
-        density[idx] = fmaxf(0.0f, mlp_output[idx * 4 + 3]);
-    }
-}
-
-__global__ void volume_render_kernel(float* rgb, float* density, float* z_vals,
+__global__ void volume_render_kernel(float* mlp_output, float* z_vals,
                                     float* rendered_rgb, int num_rays) {
     int ray_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (ray_idx < num_rays) {
@@ -155,18 +126,20 @@ __global__ void volume_render_kernel(float* rgb, float* density, float* z_vals,
                 (FAR_PLANE - z_vals[sample_idx]) : 
                 (z_vals[sample_idx + 1] - z_vals[sample_idx]);
             
-            float alpha = 1.0f - expf(-density[sample_idx] * delta);
+            // Extract density (with ReLU) and colors (with sigmoid)
+            float density = fmaxf(0.0f, mlp_output[sample_idx * 4 + 3]);
+            float r = 1.0f / (1.0f + expf(-mlp_output[sample_idx * 4 + 0]));
+            float g = 1.0f / (1.0f + expf(-mlp_output[sample_idx * 4 + 1]));
+            float b = 1.0f / (1.0f + expf(-mlp_output[sample_idx * 4 + 2]));
+            
+            float alpha = 1.0f - expf(-density * delta);
             float transmittance = expf(-accumulated_alpha);
             
-            float sig_r = 1.0f / (1.0f + expf(-rgb[sample_idx * 4 + 0]));
-            float sig_g = 1.0f / (1.0f + expf(-rgb[sample_idx * 4 + 1]));
-            float sig_b = 1.0f / (1.0f + expf(-rgb[sample_idx * 4 + 2]));
+            accumulated_rgb[0] += transmittance * alpha * r;
+            accumulated_rgb[1] += transmittance * alpha * g;
+            accumulated_rgb[2] += transmittance * alpha * b;
             
-            accumulated_rgb[0] += transmittance * alpha * sig_r;
-            accumulated_rgb[1] += transmittance * alpha * sig_g;
-            accumulated_rgb[2] += transmittance * alpha * sig_b;
-            
-            accumulated_alpha += density[sample_idx] * delta;
+            accumulated_alpha += density * delta;
         }
         
         rendered_rgb[ray_idx * 3 + 0] = accumulated_rgb[0];
@@ -175,191 +148,160 @@ __global__ void volume_render_kernel(float* rgb, float* density, float* z_vals,
     }
 }
 
-__global__ void prepare_mlp_target_kernel(float* target_rgb, float* mlp_target, int num_rays) {
-    int ray_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ray_idx < num_rays) {
-        for (int s = 0; s < NUM_SAMPLES; s++) {
-            int sample_idx = ray_idx * NUM_SAMPLES + s;
-            int mlp_idx = sample_idx * 4;
-            int rgb_idx = ray_idx * 3;
-            
-            mlp_target[mlp_idx + 0] = target_rgb[rgb_idx + 0];
-            mlp_target[mlp_idx + 1] = target_rgb[rgb_idx + 1];
-            mlp_target[mlp_idx + 2] = target_rgb[rgb_idx + 2];
-            mlp_target[mlp_idx + 3] = 1.0f;
-        }
+__global__ void calculate_loss_kernel(float* rendered_rgb, float* target_rgb,
+                                     float* loss, int num_rays) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_rays * 3) {
+        float diff = rendered_rgb[idx] - target_rgb[idx];
+        loss[idx] = diff * diff;
     }
 }
 
-__global__ void volume_gradient_kernel(float* rendered_rgb, float* target_rgb, float* mlp_output,
-                                     float* z_vals, float* density, float* volume_grad, int num_rays) {
+__global__ void volume_gradient_kernel(float* rendered_rgb, float* target_rgb,
+                                      float* mlp_output, float* z_vals,
+                                      float* mlp_grad, int num_rays) {
     int ray_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (ray_idx < num_rays) {
+        // Gradient of loss w.r.t. rendered color
         float grad_rgb[3];
         grad_rgb[0] = 2.0f * (rendered_rgb[ray_idx * 3 + 0] - target_rgb[ray_idx * 3 + 0]);
         grad_rgb[1] = 2.0f * (rendered_rgb[ray_idx * 3 + 1] - target_rgb[ray_idx * 3 + 1]);
         grad_rgb[2] = 2.0f * (rendered_rgb[ray_idx * 3 + 2] - target_rgb[ray_idx * 3 + 2]);
         
+        // Backpropagate through volume rendering
         for (int s = 0; s < NUM_SAMPLES; s++) {
             int sample_idx = ray_idx * NUM_SAMPLES + s;
-            int mlp_idx = sample_idx * 4;
             
             float delta = (s == NUM_SAMPLES - 1) ? 
                 (FAR_PLANE - z_vals[sample_idx]) : 
                 (z_vals[sample_idx + 1] - z_vals[sample_idx]);
             
+            // Compute transmittance up to this sample
             float accumulated_alpha = 0.0f;
             for (int prev = 0; prev < s; prev++) {
-                accumulated_alpha += density[ray_idx * NUM_SAMPLES + prev] * delta;
+                int prev_idx = ray_idx * NUM_SAMPLES + prev;
+                float prev_density = fmaxf(0.0f, mlp_output[prev_idx * 4 + 3]);
+                accumulated_alpha += prev_density * delta;
             }
-            
             float transmittance = expf(-accumulated_alpha);
-            float alpha = 1.0f - expf(-density[sample_idx] * delta);
             
-            float sig_r = 1.0f / (1.0f + expf(-mlp_output[mlp_idx + 0]));
-            float sig_g = 1.0f / (1.0f + expf(-mlp_output[mlp_idx + 1]));
-            float sig_b = 1.0f / (1.0f + expf(-mlp_output[mlp_idx + 2]));
+            float density = fmaxf(0.0f, mlp_output[sample_idx * 4 + 3]);
+            float alpha = 1.0f - expf(-density * delta);
             
-            volume_grad[mlp_idx + 0] = grad_rgb[0] * transmittance * alpha * sig_r * (1.0f - sig_r);
-            volume_grad[mlp_idx + 1] = grad_rgb[1] * transmittance * alpha * sig_g * (1.0f - sig_g);
-            volume_grad[mlp_idx + 2] = grad_rgb[2] * transmittance * alpha * sig_b * (1.0f - sig_b);
-            volume_grad[mlp_idx + 3] = (grad_rgb[0] * sig_r + grad_rgb[1] * sig_g + grad_rgb[2] * sig_b) * 
-                                     transmittance * delta * expf(-density[sample_idx] * delta);
+            // Sigmoid activations and their derivatives
+            float r = 1.0f / (1.0f + expf(-mlp_output[sample_idx * 4 + 0]));
+            float g = 1.0f / (1.0f + expf(-mlp_output[sample_idx * 4 + 1]));
+            float b = 1.0f / (1.0f + expf(-mlp_output[sample_idx * 4 + 2]));
+            
+            // Gradients w.r.t. MLP outputs (before activation)
+            mlp_grad[sample_idx * 4 + 0] = grad_rgb[0] * transmittance * alpha * r * (1.0f - r);
+            mlp_grad[sample_idx * 4 + 1] = grad_rgb[1] * transmittance * alpha * g * (1.0f - g);
+            mlp_grad[sample_idx * 4 + 2] = grad_rgb[2] * transmittance * alpha * b * (1.0f - b);
+            
+            // Gradient w.r.t. density (more complex due to transmittance effects)
+            float color_contrib = grad_rgb[0] * r + grad_rgb[1] * g + grad_rgb[2] * b;
+            mlp_grad[sample_idx * 4 + 3] = color_contrib * transmittance * delta * expf(-density * delta);
         }
     }
 }
 
-NeRF* init_nerf(int max_rays, cublasHandle_t cublas_handle) {
+NeRF* init_nerf(int num_rays, cublasHandle_t cublas_handle) {
     NeRF* nerf = (NeRF*)malloc(sizeof(NeRF));
-    nerf->max_rays = max_rays;
-    nerf->max_samples = max_rays * NUM_SAMPLES;
+    nerf->num_rays = num_rays;
+    nerf->num_samples = num_rays * NUM_SAMPLES;
     nerf->cublas_handle = cublas_handle;
     
-    const int input_dim = 63;
+    // Initialize MLP with simple 3D input (no positional encoding)
+    const int input_dim = 3;
     const int hidden_dim = 256;
     const int output_dim = 4;
-    const int batch_size = 4096;
+    const int batch_size = nerf->num_samples;  // Handle all samples at once
     
     nerf->position_mlp = init_mlp(input_dim, hidden_dim, output_dim, batch_size, cublas_handle);
     
-    CHECK_CUDA(cudaMalloc(&nerf->d_encoded_pos, nerf->max_samples * 63 * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&nerf->d_density, nerf->max_samples * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&nerf->d_rendered_rgb, max_rays * 3 * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&nerf->d_target_rgb, max_rays * 3 * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&nerf->d_rays_o, max_rays * 3 * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&nerf->d_rays_d, max_rays * 3 * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&nerf->d_z_vals, nerf->max_samples * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&nerf->d_mlp_input, batch_size * input_dim * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&nerf->d_mlp_output, nerf->max_samples * output_dim * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&nerf->d_mlp_target, nerf->max_samples * output_dim * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&nerf->d_volume_grad, nerf->max_samples * output_dim * sizeof(float)));
+    // Allocate GPU memory
+    CHECK_CUDA(cudaMalloc(&nerf->d_positions, nerf->num_samples * 3 * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&nerf->d_rendered_rgb, num_rays * 3 * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&nerf->d_target_rgb, num_rays * 3 * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&nerf->d_rays_o, num_rays * 3 * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&nerf->d_rays_d, num_rays * 3 * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&nerf->d_z_vals, nerf->num_samples * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&nerf->d_mlp_output, nerf->num_samples * 4 * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&nerf->d_color_grad, nerf->num_samples * 4 * sizeof(float)));
     
     return nerf;
 }
 
 void free_nerf(NeRF* nerf) {
     free_mlp(nerf->position_mlp);
-    cudaFree(nerf->d_encoded_pos);
-    cudaFree(nerf->d_density);
+    cudaFree(nerf->d_positions);
     cudaFree(nerf->d_rendered_rgb);
     cudaFree(nerf->d_target_rgb);
     cudaFree(nerf->d_rays_o);
     cudaFree(nerf->d_rays_d);
     cudaFree(nerf->d_z_vals);
-    cudaFree(nerf->d_mlp_input);
     cudaFree(nerf->d_mlp_output);
-    cudaFree(nerf->d_mlp_target);
-    cudaFree(nerf->d_volume_grad);
+    cudaFree(nerf->d_color_grad);
     free(nerf);
 }
 
-void forward_pass(NeRF* nerf, float* d_rays_o, float* d_rays_d, int num_rays) {
-    dim3 grid_dim(num_rays);
+void forward_pass(NeRF* nerf) {
+    // 1. Sample 3D points along rays (no positional encoding)
+    dim3 grid_dim(nerf->num_rays);
     dim3 block_dim(NUM_SAMPLES);
-    sample_and_encode_kernel<<<grid_dim, block_dim>>>(
-        d_rays_o, d_rays_d, nerf->d_encoded_pos, nerf->d_z_vals, num_rays);
+    sample_points_kernel<<<grid_dim, block_dim>>>(
+        nerf->d_rays_o, nerf->d_rays_d, nerf->d_positions, nerf->d_z_vals, nerf->num_rays);
     
-    int total_samples = num_rays * NUM_SAMPLES;
-    int batch_size = nerf->position_mlp->batch_size;
+    // 2. Run MLP on all samples at once (no batching loop!)
+    forward_pass_mlp(nerf->position_mlp, nerf->d_positions);
     
-    for (int i = 0; i < total_samples; i += batch_size) {
-        int current_batch = min(batch_size, total_samples - i);
-        
-        CHECK_CUDA(cudaMemcpy(nerf->d_mlp_input, 
-                             &nerf->d_encoded_pos[i * 63], 
-                             current_batch * 63 * sizeof(float), 
-                             cudaMemcpyDeviceToDevice));
-        
-        if (current_batch < batch_size) {
-            CHECK_CUDA(cudaMemset(&nerf->d_mlp_input[current_batch * 63], 0, 
-                                 (batch_size - current_batch) * 63 * sizeof(float)));
-        }
-        
-        forward_pass_mlp(nerf->position_mlp, nerf->d_mlp_input);
-        
-        CHECK_CUDA(cudaMemcpy(&nerf->d_mlp_output[i * 4], 
-                             nerf->position_mlp->d_layer2_output, 
-                             current_batch * 4 * sizeof(float), 
-                             cudaMemcpyDeviceToDevice));
-    }
+    // 3. Copy MLP output for volume rendering
+    CHECK_CUDA(cudaMemcpy(nerf->d_mlp_output, nerf->position_mlp->d_layer2_output, 
+                         nerf->num_samples * 4 * sizeof(float), cudaMemcpyDeviceToDevice));
     
+    // 4. Volume render to get final pixel colors
     int block_size = 256;
-    int num_blocks = (total_samples + block_size - 1) / block_size;
-    extract_density_kernel<<<num_blocks, block_size>>>(
-        nerf->d_mlp_output, nerf->d_density, total_samples);
-    
-    num_blocks = (num_rays + block_size - 1) / block_size;
+    int num_blocks = (nerf->num_rays + block_size - 1) / block_size;
     volume_render_kernel<<<num_blocks, block_size>>>(
-        nerf->d_mlp_output, nerf->d_density, nerf->d_z_vals, 
-        nerf->d_rendered_rgb, num_rays);
+        nerf->d_mlp_output, nerf->d_z_vals, nerf->d_rendered_rgb, nerf->num_rays);
 }
 
-float calculate_loss(NeRF* nerf, float* d_target_rgb, int num_rays) {
-    CHECK_CUDA(cudaMemcpy(nerf->d_target_rgb, d_target_rgb, 
-                         num_rays * 3 * sizeof(float), cudaMemcpyDeviceToDevice));
+float calculate_loss(NeRF* nerf) {
+    int total_elements = nerf->num_rays * 3;
     
+    // Allocate temporary memory for loss values
+    float* d_losses;
+    CHECK_CUDA(cudaMalloc(&d_losses, total_elements * sizeof(float)));
+    
+    // Calculate squared differences
     int block_size = 256;
-    int num_blocks = (num_rays + block_size - 1) / block_size;
-    prepare_mlp_target_kernel<<<num_blocks, block_size>>>(
-        nerf->d_target_rgb, nerf->d_mlp_target, num_rays);
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+    calculate_loss_kernel<<<num_blocks, block_size>>>(
+        nerf->d_rendered_rgb, nerf->d_target_rgb, d_losses, nerf->num_rays);
     
-    return calculate_loss_mlp(nerf->position_mlp, nerf->d_mlp_target);
+    // Sum up losses on GPU
+    float total_loss = 0.0f;
+    CHECK_CUBLAS(cublasSasum(nerf->cublas_handle, total_elements, d_losses, 1, &total_loss));
+    
+    CHECK_CUDA(cudaFree(d_losses));
+    return total_loss / total_elements;
 }
 
-void backward_pass(NeRF* nerf, int num_rays) {
-    zero_gradients_mlp(nerf->position_mlp);
-    
+void backward_pass(NeRF* nerf) {
+    // Calculate gradients through volume rendering (no batching loop!)
     int block_size = 256;
-    int num_blocks = (num_rays + block_size - 1) / block_size;
+    int num_blocks = (nerf->num_rays + block_size - 1) / block_size;
     volume_gradient_kernel<<<num_blocks, block_size>>>(
         nerf->d_rendered_rgb, nerf->d_target_rgb, nerf->d_mlp_output,
-        nerf->d_z_vals, nerf->d_density, nerf->d_volume_grad, num_rays);
+        nerf->d_z_vals, nerf->d_color_grad, nerf->num_rays);
     
-    int total_samples = num_rays * NUM_SAMPLES;
-    int batch_size = nerf->position_mlp->batch_size;
+    // Copy gradients to MLP output layer
+    CHECK_CUDA(cudaMemcpy(nerf->position_mlp->d_error_output, nerf->d_color_grad,
+                         nerf->num_samples * 4 * sizeof(float), cudaMemcpyDeviceToDevice));
     
-    for (int i = 0; i < total_samples; i += batch_size) {
-        int current_batch = min(batch_size, total_samples - i);
-        
-        CHECK_CUDA(cudaMemcpy(nerf->position_mlp->d_layer2_output, 
-                             &nerf->d_volume_grad[i * 4], 
-                             current_batch * 4 * sizeof(float), 
-                             cudaMemcpyDeviceToDevice));
-        
-        CHECK_CUDA(cudaMemcpy(nerf->d_mlp_input, 
-                             &nerf->d_encoded_pos[i * 63], 
-                             current_batch * 63 * sizeof(float), 
-                             cudaMemcpyDeviceToDevice));
-        
-        if (current_batch < batch_size) {
-            CHECK_CUDA(cudaMemset(&nerf->d_mlp_input[current_batch * 63], 0, 
-                                 (batch_size - current_batch) * 63 * sizeof(float)));
-            CHECK_CUDA(cudaMemset(&nerf->position_mlp->d_layer2_output[current_batch * 4], 0, 
-                                 (batch_size - current_batch) * 4 * sizeof(float)));
-        }
-        
-        backward_pass_mlp(nerf->position_mlp, nerf->d_mlp_input);
-    }
+    // Backpropagate through MLP
+    zero_gradients_mlp(nerf->position_mlp);
+    backward_pass_mlp(nerf->position_mlp, nerf->d_positions);
 }
 
 void update_weights(NeRF* nerf, float learning_rate) {
