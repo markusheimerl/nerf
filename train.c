@@ -6,14 +6,12 @@ int main() {
     cublasHandle_t cublas_handle;
     CHECK_CUBLAS(cublasCreate(&cublas_handle));
     
-    const int batch_size = 4096;
     const int max_rays = 1024;
-    const int num_train_images = 5; // Reduced for proof of concept
+    const int num_train_images = 5;
     
-    NeRF* nerf = init_nerf(batch_size, max_rays, cublas_handle);
-    printf("NeRF initialized\n");
+    NeRF* nerf = init_nerf(max_rays, cublas_handle);
+    printf("NeRF initialized with MLP backend\n");
     
-    // Load training data
     Image** images = (Image**)malloc(num_train_images * sizeof(Image*));
     Camera** cameras = (Camera**)malloc(num_train_images * sizeof(Camera*));
     float** image_data = (float**)malloc(num_train_images * sizeof(float*));
@@ -42,7 +40,6 @@ int main() {
         printf("Loaded image %d: %dx%d\n", i, images[i]->width, images[i]->height);
     }
     
-    // Device memory for camera and pixels
     float *d_cam_pos, *d_cam_rot;
     int *d_pixel_coords;
     CHECK_CUDA(cudaMalloc(&d_cam_pos, 3 * sizeof(float)));
@@ -55,7 +52,7 @@ int main() {
     const int num_epochs = 100;
     const float learning_rate = 1e-3f;
     
-    printf("Starting training...\n");
+    printf("Starting training with MLP backend...\n");
     
     for (int epoch = 0; epoch < num_epochs; epoch++) {
         float total_loss = 0.0f;
@@ -68,7 +65,6 @@ int main() {
             CHECK_CUDA(cudaMemcpy(d_cam_pos, cam->position, 3 * sizeof(float), cudaMemcpyHostToDevice));
             CHECK_CUDA(cudaMemcpy(d_cam_rot, cam->rotation, 9 * sizeof(float), cudaMemcpyHostToDevice));
             
-            // Sample random pixels
             for (int i = 0; i < max_rays; i++) {
                 int u = rand() % cam->width;
                 int v = rand() % cam->height;
@@ -84,7 +80,6 @@ int main() {
             CHECK_CUDA(cudaMemcpy(d_pixel_coords, h_pixel_coords, max_rays * 2 * sizeof(int), cudaMemcpyHostToDevice));
             CHECK_CUDA(cudaMemcpy(nerf->d_target_rgb, h_target_rgb, max_rays * 3 * sizeof(float), cudaMemcpyHostToDevice));
             
-            // Generate rays
             int block_size = 256;
             int num_blocks = (max_rays + block_size - 1) / block_size;
             generate_rays_kernel<<<num_blocks, block_size>>>(
@@ -92,15 +87,12 @@ int main() {
                 d_cam_pos, d_cam_rot, cam->focal,
                 cam->width * 0.5f, cam->height * 0.5f, max_rays);
             
-            // Forward pass
             forward_pass(nerf, nerf->d_rays_o, nerf->d_rays_d, max_rays);
             
-            // Calculate loss
             float loss = calculate_loss(nerf, nerf->d_target_rgb, max_rays);
             total_loss += loss;
             num_batches++;
             
-            // Backward pass and update
             backward_pass(nerf, max_rays);
             update_weights(nerf, learning_rate);
         }
@@ -112,7 +104,6 @@ int main() {
     
     printf("Training completed!\n");
     
-    // Cleanup
     for (int i = 0; i < num_train_images; i++) {
         free_image(images[i]);
         free(cameras[i]);
