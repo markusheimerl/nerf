@@ -1,4 +1,5 @@
 #include "nerf.h"
+#include <json-c/json.h>
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
 
@@ -121,6 +122,73 @@ __global__ void volume_render_kernel(float* colors, float* densities, float* z_v
     }
 }
 
+// CUDA kernel for volume rendering backward pass
+__global__ void volume_render_backward_kernel(
+    float* colors, float* densities, float* z_vals,
+    float* rgb_grad, float* color_grad, float* density_grad,
+    int num_rays) {
+    
+    int ray_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ray_idx < num_rays) {
+        
+        // Forward pass to compute transmittances
+        float accumulated_alpha = 0.0f;
+        float transmittances[NUM_SAMPLES];
+        float alphas[NUM_SAMPLES];
+        
+        for (int s = 0; s < NUM_SAMPLES; s++) {
+            int sample_idx = ray_idx * NUM_SAMPLES + s;
+            
+            float delta;
+            if (s == NUM_SAMPLES - 1) {
+                delta = FAR_PLANE - z_vals[sample_idx];
+            } else {
+                delta = z_vals[sample_idx + 1] - z_vals[sample_idx];
+            }
+            
+            alphas[s] = 1.0f - expf(-densities[sample_idx] * delta);
+            transmittances[s] = expf(-accumulated_alpha);
+            accumulated_alpha += densities[sample_idx] * delta;
+        }
+        
+        // Backward pass
+        for (int s = 0; s < NUM_SAMPLES; s++) {
+            int sample_idx = ray_idx * NUM_SAMPLES + s;
+            
+            float delta;
+            if (s == NUM_SAMPLES - 1) {
+                delta = FAR_PLANE - z_vals[sample_idx];
+            } else {
+                delta = z_vals[sample_idx + 1] - z_vals[sample_idx];
+            }
+            
+            // Gradient w.r.t colors
+            for (int c = 0; c < 3; c++) {
+                color_grad[sample_idx * 3 + c] = 
+                    rgb_grad[ray_idx * 3 + c] * transmittances[s] * alphas[s];
+            }
+            
+            // Gradient w.r.t density
+            float density_grad_val = 0.0f;
+            for (int c = 0; c < 3; c++) {
+                // Direct contribution
+                density_grad_val += rgb_grad[ray_idx * 3 + c] * 
+                    transmittances[s] * expf(-densities[sample_idx] * delta) * delta * 
+                    colors[sample_idx * 3 + c];
+                
+                // Indirect contribution through transmittance
+                for (int s2 = s + 1; s2 < NUM_SAMPLES; s2++) {
+                    int sample_idx2 = ray_idx * NUM_SAMPLES + s2;
+                    density_grad_val -= rgb_grad[ray_idx * 3 + c] *
+                        transmittances[s2] * alphas[s2] * delta *
+                        colors[sample_idx2 * 3 + c];
+                }
+            }
+            density_grad[sample_idx] = density_grad_val;
+        }
+    }
+}
+
 // Utility kernels
 __global__ void sigmoid_activation_kernel(float* data, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -182,6 +250,9 @@ NeRF* init_nerf(int pos_encode_levels, int dir_encode_levels, int hidden_dim,
     CHECK_CUDA(cudaMalloc(&nerf->d_densities, max_samples * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&nerf->d_rendered_rgb, max_rays * 3 * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&nerf->d_target_rgb, max_rays * 3 * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&nerf->d_color_grad, max_samples * 3 * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&nerf->d_density_grad, max_samples * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&nerf->d_rgb_grad, max_rays * 3 * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&nerf->d_pixel_coords, max_rays * 2 * sizeof(int)));
     
     return nerf;
@@ -201,6 +272,9 @@ void free_nerf(NeRF* nerf) {
     cudaFree(nerf->d_densities);
     cudaFree(nerf->d_rendered_rgb);
     cudaFree(nerf->d_target_rgb);
+    cudaFree(nerf->d_color_grad);
+    cudaFree(nerf->d_density_grad);
+    cudaFree(nerf->d_rgb_grad);
     cudaFree(nerf->d_pixel_coords);
     
     free(nerf);
@@ -226,7 +300,10 @@ void render_rays(NeRF* nerf, float* d_rays_o, float* d_rays_d, int num_rays) {
     
     // Encode directions (offset in encoded_input)
     int pos_encoded_dim = 3 * (1 + 2 * nerf->pos_encode_levels);
-    float* dir_encoded_start = nerf->d_encoded_input + pos_encoded_dim;
+    float* dir_encoded_start = nerf->d_encoded_input;
+    for (int i = 0; i < total_samples; i++) {
+        dir_encoded_start += pos_encoded_dim;
+    }
     positional_encoding_kernel<<<num_blocks, block_size>>>(
         nerf->d_directions, dir_encoded_start, 3, nerf->dir_encode_levels, total_samples);
     
@@ -240,13 +317,11 @@ void render_rays(NeRF* nerf, float* d_rays_o, float* d_rays_d, int num_rays) {
             forward_pass_mlp(nerf->coarse_mlp, &nerf->d_encoded_input[batch_start * nerf->input_dim]);
             
             // Extract colors and densities
-            const float alpha = 1.0f, beta = 0.0f;
-            // Copy RGB (first 3 outputs)
             CHECK_CUBLAS(cublasScopy(nerf->cublas_handle, current_batch_size * 3,
                                    nerf->coarse_mlp->d_layer2_output, 1,
                                    &nerf->d_colors[batch_start * 3], 1));
             
-            // Copy densities (4th output) - this is simplified, you'd need proper strided copy
+            // Copy densities (4th output)
             for (int i = 0; i < current_batch_size; i++) {
                 CHECK_CUDA(cudaMemcpy(&nerf->d_densities[batch_start + i],
                                      &nerf->coarse_mlp->d_layer2_output[i * 4 + 3],
@@ -283,6 +358,108 @@ float calculate_loss_nerf(NeRF* nerf, float* d_target_rgb, int num_rays) {
     CHECK_CUDA(cudaFree(d_loss));
     
     return h_loss / (num_rays * 3);
+}
+
+void backward_pass_nerf(NeRF* nerf, float* d_target_rgb, int num_rays) {
+    int block_size = 256;
+    int num_blocks;
+    
+    // Calculate gradients w.r.t rendered RGB
+    num_blocks = (num_rays * 3 + block_size - 1) / block_size;
+    mse_grad_kernel<<<num_blocks, block_size>>>(
+        nerf->d_rendered_rgb, d_target_rgb, nerf->d_rgb_grad, num_rays * 3);
+    
+    // Backward pass through volume rendering
+    num_blocks = (num_rays + block_size - 1) / block_size;
+    volume_render_backward_kernel<<<num_blocks, block_size>>>(
+        nerf->d_colors, nerf->d_densities, nerf->d_z_vals,
+        nerf->d_rgb_grad, nerf->d_color_grad, nerf->d_density_grad, num_rays);
+    
+    // TODO: Backward pass through MLP using color_grad and density_grad
+    // This would require implementing backward pass for the MLP with custom gradients
+    // For now, we'll use the simplified approach of just updating MLP weights
+}
+
+void update_weights_nerf(NeRF* nerf, float learning_rate) {
+    update_weights_mlp(nerf->coarse_mlp, learning_rate);
+}
+
+Camera* load_camera_from_transforms(const char* filename, int frame_idx) {
+    FILE* fp = fopen(filename, "r");
+    if (!fp) {
+        printf("Error: Could not open %s\n", filename);
+        return NULL;
+    }
+    
+    // Read entire file
+    fseek(fp, 0, SEEK_END);
+    long length = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    char* data = (char*)malloc(length + 1);
+    fread(data, 1, length, fp);
+    data[length] = '\0';
+    fclose(fp);
+    
+    // Parse JSON
+    json_object* root = json_tokener_parse(data);
+    json_object* camera_angle_x_obj;
+    json_object* frames_obj;
+    
+    if (!json_object_object_get_ex(root, "camera_angle_x", &camera_angle_x_obj) ||
+        !json_object_object_get_ex(root, "frames", &frames_obj)) {
+        printf("Error: Invalid transforms.json format\n");
+        free(data);
+        json_object_put(root);
+        return NULL;
+    }
+    
+    double camera_angle_x = json_object_get_double(camera_angle_x_obj);
+    int num_frames = json_object_array_length(frames_obj);
+    
+    if (frame_idx >= num_frames) {
+        printf("Error: Frame index %d out of range (0-%d)\n", frame_idx, num_frames - 1);
+        free(data);
+        json_object_put(root);
+        return NULL;
+    }
+    
+    json_object* frame = json_object_array_get_idx(frames_obj, frame_idx);
+    json_object* transform_matrix_obj;
+    
+    if (!json_object_object_get_ex(frame, "transform_matrix", &transform_matrix_obj)) {
+        printf("Error: No transform_matrix in frame %d\n", frame_idx);
+        free(data);
+        json_object_put(root);
+        return NULL;
+    }
+    
+    Camera* cam = (Camera*)malloc(sizeof(Camera));
+    
+    // Extract camera position and rotation from transform matrix
+    for (int i = 0; i < 4; i++) {
+        json_object* row = json_object_array_get_idx(transform_matrix_obj, i);
+        for (int j = 0; j < 4; j++) {
+            json_object* val = json_object_array_get_idx(row, j);
+            double v = json_object_get_double(val);
+            
+            if (j < 3 && i < 3) {
+                cam->rotation[i * 3 + j] = (float)v;
+            } else if (j == 3 && i < 3) {
+                cam->position[i] = (float)v;
+            }
+        }
+    }
+    
+    // Assume image size (you might want to load this from the actual images)
+    cam->width = 400;  // Adjust based on your images
+    cam->height = 400;
+    
+    // Calculate focal length from field of view
+    cam->focal = cam->width / (2.0f * tanf(camera_angle_x / 2.0f));
+    
+    free(data);
+    json_object_put(root);
+    return cam;
 }
 
 void save_nerf(NeRF* nerf, const char* filename) {

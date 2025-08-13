@@ -9,6 +9,7 @@
 #include <cublas_v2.h>
 #include "mlp/gpu/mlp.h"
 #include "mlp/data.h"
+#include "image_utils.h"
 
 #define MAX_ENCODING_FUNCS 10
 #define NUM_SAMPLES 64
@@ -61,6 +62,9 @@ typedef struct {
     float* d_densities; // Volume densities
     float* d_rendered_rgb; // Final rendered colors
     float* d_target_rgb;   // Target RGB values for training
+    float* d_color_grad;   // Gradients w.r.t colors
+    float* d_density_grad; // Gradients w.r.t densities
+    float* d_rgb_grad;     // Gradients w.r.t rendered RGB
     int* d_pixel_coords;   // Pixel coordinates
     
     cublasHandle_t cublas_handle;
@@ -76,6 +80,9 @@ __global__ void positional_encoding_kernel(float* input, float* output, int inpu
                                           int levels, int num_samples);
 __global__ void volume_render_kernel(float* colors, float* densities, float* z_vals, 
                                     float* rgb_output, int num_rays);
+__global__ void volume_render_backward_kernel(float* colors, float* densities, float* z_vals,
+                                             float* rgb_grad, float* color_grad, float* density_grad,
+                                             int num_rays);
 __global__ void sigmoid_activation_kernel(float* data, int size);
 __global__ void relu_activation_kernel(float* data, int size);
 __global__ void mse_loss_kernel(float* rendered, float* target, float* loss, int size);
