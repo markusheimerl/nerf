@@ -175,15 +175,20 @@ int main() {
     
     printf("Loading images and generating NeRF training data...\n");
     
+    // Get timestamp for filename
+    time_t now = time(NULL);
+    char data_fname[64];
+    strftime(data_fname, sizeof(data_fname), "%Y%m%d_%H%M%S_data.csv", localtime(&now));
+    
     // Open output CSV file
-    FILE* csv = fopen("nerf_training_data.csv", "w");
+    FILE* csv = fopen(data_fname, "w");
     if (!csv) {
         fprintf(stderr, "Failed to open output CSV file\n");
         return -1;
     }
     
     // Write CSV header
-    fprintf(csv, "ray_id,sample_id,x,y,z,dx,dy,dz,r_true,g_true,b_true\n");
+    fprintf(csv, "image_filename,ray_id,sample_id,x,y,z,dx,dy,dz,r_true,g_true,b_true\n");
     
     int global_ray_id = 0;
     
@@ -194,6 +199,9 @@ int main() {
         // Load image
         char img_path[256];
         snprintf(img_path, sizeof(img_path), "./data/r_%d.png", img_idx);
+        char img_filename[256];
+        snprintf(img_filename, sizeof(img_filename), "r_%d.png", img_idx);
+        
         Image* img = load_png(img_path);
         if (!img) {
             fprintf(stderr, "Failed to load %s\n", img_path);
@@ -237,8 +245,8 @@ int main() {
                 float z = ray_o[2] + t * ray_d[2];
                 
                 // Write to CSV
-                fprintf(csv, "%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
-                       global_ray_id, sample_idx, x, y, z, 
+                fprintf(csv, "%s,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                       img_filename, global_ray_id, sample_idx, x, y, z, 
                        ray_d[0], ray_d[1], ray_d[2],
                        r_true, g_true, b_true);
             }
@@ -255,7 +263,7 @@ int main() {
     printf("Generated training data for %d rays with %d samples each\n", 
            global_ray_id, NUM_SAMPLES);
     printf("Total data points: %d\n", global_ray_id * NUM_SAMPLES);
-    printf("Data saved to: nerf_training_data.csv\n");
+    printf("Data saved to: %s\n", data_fname);
     
     return 0;
 }
