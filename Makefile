@@ -22,5 +22,5 @@ run: train.out
 	@time ./train.out
 
 clean:
-	rm -f *.out *.o *.csv *.bin
+	rm -f *.out *.o *.bin rendered_image.png
 	$(MAKE) -C mlp/gpu clean
