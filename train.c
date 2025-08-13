@@ -10,7 +10,7 @@ int main() {
     const int num_train_images = 5;
     
     NeRF* nerf = init_nerf(num_rays, cublas_handle);
-    printf("NeRF initialized (simplified, no positional encoding)\n");
+    printf("NeRF initialized\n");
     
     // Load training data
     Image** images = (Image**)malloc(num_train_images * sizeof(Image*));
