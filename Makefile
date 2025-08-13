@@ -6,36 +6,20 @@ ARCH ?= sm_87
 CUDAFLAGS = --cuda-gpu-arch=$(ARCH) -x cuda -Wno-unknown-cuda-version
 CUDALIBS = -L/usr/local/cuda/lib64 -lcudart -lcublas
 
-# Source files
-MLP_GPU_SOURCES = mlp/gpu/mlp.c mlp/data.c
-NERF_SOURCES = nerf.c train_nerf.c
+train.out: mlp.o nerf.o train.o
+	$(CC) mlp.o nerf.o train.o $(CUDALIBS) $(LDFLAGS) -o $@
 
-# Object files
-MLP_GPU_OBJECTS = $(MLP_GPU_SOURCES:.c=.o)
-NERF_OBJECTS = $(NERF_SOURCES:.c=.o)
+mlp.o: mlp/gpu/mlp.c mlp/gpu/mlp.h
+	$(CC) $(CFLAGS) $(CUDAFLAGS) -c mlp/gpu/mlp.c -o $@
 
-# Targets
-all: train_nerf.out
+nerf.o: nerf.c nerf.h
+	$(CC) $(CFLAGS) $(CUDAFLAGS) -c nerf.c -o $@
 
-train_nerf.out: $(MLP_GPU_OBJECTS) $(NERF_OBJECTS)
-	$(CC) $(CFLAGS) -o $@ $^ $(CUDALIBS) $(LDFLAGS)
+train.o: train.c nerf.h
+	$(CC) $(CFLAGS) $(CUDAFLAGS) -c train.c -o $@
 
-# Pattern rule for GPU MLP objects
-mlp/gpu/%.o: mlp/gpu/%.c
-	$(CC) $(CFLAGS) $(CUDAFLAGS) -c $< -o $@
-
-# Pattern rule for regular objects  
-mlp/%.o: mlp/%.c
-	$(CC) $(CFLAGS) $(CUDAFLAGS) -c $< -o $@
-
-# Pattern rule for NeRF objects
-%.o: %.c
-	$(CC) $(CFLAGS) $(CUDAFLAGS) -c $< -o $@
+run: train.out
+	@time ./train.out
 
 clean:
-	rm -f $(MLP_GPU_OBJECTS) $(NERF_OBJECTS) train_nerf.out *.bin
-
-run: train_nerf.out
-	time ./train_nerf.out
-
-.PHONY: all clean run
+	rm -f *.out *.o *.csv *.bin
