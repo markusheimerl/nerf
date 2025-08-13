@@ -13,4 +13,4 @@ data: data.out
 
 clean:
 	rm -f *.out *.o *.csv
-	$(MAKE) -C mlp/gpu clean
+	$(MAKE) -C mlp clean
