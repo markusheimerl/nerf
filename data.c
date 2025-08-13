@@ -170,8 +170,8 @@ void generate_ray(Camera* cam, int u, int v, float* ray_o, float* ray_d) {
 }
 
 int main() {
-    const int num_images = 100;  // Use all 100 images
-    const int rays_per_image = 1000;  // Sample 1000 random rays per image
+    const int num_images = 100;
+    const int rays_per_image = 1024;
     
     printf("Loading images and generating NeRF training data...\n");
     
