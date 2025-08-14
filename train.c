@@ -13,15 +13,15 @@
 #define RENDER_HEIGHT 128
 
 // --- Positional Encoding Parameters ---
-#define POS_ENC_L 10
+#define POS_ENC_L 8
 #define DIR_ENC_L 4
 #define INPUT_POS_DIM 3
 #define INPUT_DIR_DIM 3
 
 #define RAW_INPUT_DIM 6
-#define POS_ENC_DIM (INPUT_POS_DIM * (2 * POS_ENC_L) + INPUT_POS_DIM) // 63
-#define DIR_ENC_DIM (INPUT_DIR_DIM * (2 * DIR_ENC_L) + INPUT_DIR_DIM) // 27
-#define PE_INPUT_DIM (POS_ENC_DIM + DIR_ENC_DIM) // 90
+#define POS_ENC_DIM (INPUT_POS_DIM * (2 * POS_ENC_L) + INPUT_POS_DIM)
+#define DIR_ENC_DIM (INPUT_DIR_DIM * (2 * DIR_ENC_L) + INPUT_DIR_DIM)
+#define PE_INPUT_DIM (POS_ENC_DIM + DIR_ENC_DIM)
 
 // CUDA kernel for activations (output_dim=4: density, rgb)
 __global__ void activation_kernel(float* d_layer2_preact, float* d_layer2_output, int batch_size, int output_dim) {
@@ -287,7 +287,7 @@ int main() {
     Dataset* dataset = load_dataset("./data/transforms.json", "./data", 100);
 
     const int input_dim = PE_INPUT_DIM;
-    const int hidden_dim = 256;
+    const int hidden_dim = 512;
     const int output_dim = 4;
     const int batch_size = RAYS_PER_BATCH * NUM_SAMPLES;
 
@@ -324,6 +324,7 @@ int main() {
     float learning_rate = 0.001f;
 
     for (int batch = 0; batch < num_batches; batch++) {
+        if (batch % 1000 == 0) learning_rate *= 0.99f;
         generate_random_batch(dataset, RAYS_PER_BATCH, batch_X, batch_true_colors);
         batch_positional_encoding(batch_X, NUM_SAMPLES, RAYS_PER_BATCH, batch_PE_X);
         cudaMemcpy(d_batch_PE_X, batch_PE_X, batch_size * PE_INPUT_DIM * sizeof(float), cudaMemcpyHostToDevice);
