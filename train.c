@@ -278,7 +278,7 @@ int main() {
     float* batch_true_colors = (float*)malloc(batch_size * 3 * sizeof(float));
     
     // Training parameters
-    const int num_epochs = 20000;
+    const int num_batches = 20000;
     float learning_rate = 0.001f;
     
     printf("Starting NeRF training...\n");
@@ -287,9 +287,9 @@ int main() {
     printf("Learning rate: %.6f\n\n", learning_rate);
     
     // Training loop
-    for (int epoch = 0; epoch < num_epochs; epoch++) {
+    for (int batch = 0; batch < num_batches; batch++) {
         // Learning rate decay
-        if (epoch > 0 && epoch % 5000 == 0) {
+        if (batch > 0 && batch % 5000 == 0) {
             learning_rate *= 0.5f;
             printf("Learning rate reduced to: %.6f\n", learning_rate);
         }
@@ -306,11 +306,11 @@ int main() {
         update_weights_mlp(mlp, learning_rate);
         
         // Print progress
-        if ((epoch + 1) % 100 == 0) {
-            printf("Epoch [%d/%d], Loss: %.6f\n", epoch + 1, num_epochs, loss);
+        if ((batch + 1) % 100 == 0) {
+            printf("Batch [%d/%d], Loss: %.6f\n", batch + 1, num_batches, loss);
             
-            // Print sample predictions every 1000 epochs
-            if ((epoch + 1) % 1000 == 0) {
+            // Print sample predictions every 1000 batches
+            if ((batch + 1) % 1000 == 0) {
                 print_sample_predictions(mlp, batch_true_colors);
             }
         }
