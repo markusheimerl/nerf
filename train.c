@@ -320,7 +320,7 @@ int main() {
 
     float* d_mlp_error_output = mlp->d_error_output;
 
-    const int num_batches = 20000;
+    const int num_batches = 200000;
     float learning_rate = 0.001f;
 
     for (int batch = 0; batch < num_batches; batch++) {
