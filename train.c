@@ -287,7 +287,7 @@ int main() {
     Dataset* dataset = load_dataset("./data/transforms.json", "./data", 100);
 
     const int input_dim = PE_INPUT_DIM;
-    const int hidden_dim = 8192;
+    const int hidden_dim = 256;
     const int output_dim = 4;
     const int batch_size = RAYS_PER_BATCH * NUM_SAMPLES;
 
@@ -320,7 +320,7 @@ int main() {
 
     float* d_mlp_error_output = mlp->d_error_output;
 
-    const int num_batches = 200000;
+    const int num_batches = 2000000;
     float learning_rate = 0.001f;
 
     for (int batch = 0; batch < num_batches; batch++) {
@@ -357,7 +357,7 @@ int main() {
         cudaMemcpy(&total_loss, d_loss_accum, sizeof(float), cudaMemcpyDeviceToHost);
         total_loss /= RAYS_PER_BATCH;
 
-        if ((batch + 1) % 10 == 0) {
+        if ((batch + 1) % 100 == 0) {
             printf("Batch [%d/%d], Loss: %.6f\n", batch + 1, num_batches, total_loss);
             if ((batch + 1) % 5000 == 0) render_test_image(mlp, dataset, batch + 1, cublas_handle);
         }
