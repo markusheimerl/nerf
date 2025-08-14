@@ -124,7 +124,7 @@ float process_batch(MLP* mlp, float* batch_true_colors) {
     
     for (int ray = 0; ray < RAYS_PER_BATCH; ray++) {
         int ray_start_idx = ray * NUM_SAMPLES;
-        float* ray_mlp_output = &mlp->layer2_output[ray_start_idx * 4];
+        float* ray_mlp_output = &mlp->layer2_preact[ray_start_idx * 4];
         float* ray_error_output = &mlp->error_output[ray_start_idx * 4];
         
         // Extract densities and colors with activations
@@ -188,10 +188,10 @@ void render_single_pixel(MLP* temp_mlp, float* ray_X, Camera* cam, int u, int v,
     float colors[NUM_SAMPLES * 3];
     
     for (int s = 0; s < NUM_SAMPLES; s++) {
-        densities[s] = relu(temp_mlp->layer2_output[s * 4]);
-        colors[s * 3 + 0] = sigmoid(temp_mlp->layer2_output[s * 4 + 1]);
-        colors[s * 3 + 1] = sigmoid(temp_mlp->layer2_output[s * 4 + 2]);
-        colors[s * 3 + 2] = sigmoid(temp_mlp->layer2_output[s * 4 + 3]);
+        densities[s] = relu(temp_mlp->layer2_preact[s * 4]);
+        colors[s * 3 + 0] = sigmoid(temp_mlp->layer2_preact[s * 4 + 1]);
+        colors[s * 3 + 1] = sigmoid(temp_mlp->layer2_preact[s * 4 + 2]);
+        colors[s * 3 + 2] = sigmoid(temp_mlp->layer2_preact[s * 4 + 3]);
     }
     
     // Render the ray
@@ -261,7 +261,7 @@ void print_sample_predictions(MLP* mlp, float* batch_true_colors) {
     printf("Sample predictions:\n");
     for (int ray = 0; ray < 3 && ray < RAYS_PER_BATCH; ray++) {
         int ray_start_idx = ray * NUM_SAMPLES;
-        float* ray_output = &mlp->layer2_output[ray_start_idx * 4];
+        float* ray_output = &mlp->layer2_preact[ray_start_idx * 4];
         
         float densities[NUM_SAMPLES], colors[NUM_SAMPLES * 3];
         for (int s = 0; s < NUM_SAMPLES; s++) {
