@@ -18,5 +18,5 @@ run: train.out
 	@time ./train.out
 
 clean:
-	rm -f *.out *.o
+	rm -f *.out *.o *_sample.png
 	$(MAKE) -C mlp clean

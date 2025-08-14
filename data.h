@@ -9,7 +9,7 @@
 #include <json-c/json.h>
 #include <time.h>
 
-#define NUM_SAMPLES 64
+#define NUM_SAMPLES 128
 #define NEAR_PLANE 2.0f
 #define FAR_PLANE 6.0f
 #define PI 3.14159265359f

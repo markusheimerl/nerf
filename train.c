@@ -7,7 +7,7 @@
 #include "mlp/mlp.h"
 #include "data.h"
 
-#define RAYS_PER_BATCH 8
+#define RAYS_PER_BATCH 512
 #define RENDER_WIDTH 128
 #define RENDER_HEIGHT 128
 
@@ -288,8 +288,8 @@ int main() {
     float* batch_true_colors = (float*)malloc(batch_size * 3 * sizeof(float));
     
     // Training parameters
-    const int num_batches = 20000;
-    float learning_rate = 0.001f;
+    const int num_batches = 2000000;
+    float learning_rate = 0.0001f;
 
     // Training loop
     for (int batch = 0; batch < num_batches; batch++) {
@@ -305,15 +305,15 @@ int main() {
         update_weights_mlp(mlp, learning_rate);
         
         // Print progress
-        if ((batch + 1) % 100 == 0) {
+        if ((batch + 1) % 10 == 0) {
             printf("Batch [%d/%d], Loss: %.6f\n", batch + 1, num_batches, loss);
             
             // Print sample predictions every 1000 batches
-            if ((batch + 1) % 1000 == 0) {
+            if ((batch + 1) % 100 == 0) {
                 print_sample_predictions(mlp, batch_true_colors);
                 
                 // Render test image every 5000 batches
-                if ((batch + 1) % 5000 == 0) {
+                if ((batch + 1) % 500 == 0) {
                     render_test_image(mlp, dataset, batch + 1);
                 }
             }
