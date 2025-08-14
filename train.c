@@ -3,9 +3,10 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#include <cblas.h>
-#include "mlp/mlp.h"
+#include "mlp/gpu/mlp.h"
 #include "data.h"
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 #define RAYS_PER_BATCH 8
 #define RENDER_WIDTH 128
@@ -75,13 +76,16 @@ void compute_volume_rendering_gradients(const float* densities, const float* col
 
 // Apply activations to layer2_output
 void apply_activations_mlp(const MLP* mlp, float* layer2_output) {
+    float* preact = (float*)malloc(mlp->batch_size * mlp->output_dim * sizeof(float));
+    cudaMemcpy(preact, mlp->d_layer2_preact, mlp->batch_size * mlp->output_dim * sizeof(float), cudaMemcpyDeviceToHost);
     for (int i = 0; i < mlp->batch_size; i++) {
         int base = i * mlp->output_dim;
-        layer2_output[base + 0] = relu(mlp->layer2_preact[base + 0]); // Density
-        layer2_output[base + 1] = sigmoid(mlp->layer2_preact[base + 1]);
-        layer2_output[base + 2] = sigmoid(mlp->layer2_preact[base + 2]);
-        layer2_output[base + 3] = sigmoid(mlp->layer2_preact[base + 3]);
+        layer2_output[base + 0] = relu(preact[base + 0]); // Density
+        layer2_output[base + 1] = sigmoid(preact[base + 1]);
+        layer2_output[base + 2] = sigmoid(preact[base + 2]);
+        layer2_output[base + 3] = sigmoid(preact[base + 3]);
     }
+    free(preact);
 }
 
 // Extract densities and colors for a ray from layer2_output
@@ -100,7 +104,7 @@ float process_batch(MLP* mlp, const float* layer2_output, const float* batch_tru
     float total_loss = 0.0f;
     for (int ray = 0; ray < RAYS_PER_BATCH; ray++) {
         int ray_start_idx = ray * NUM_SAMPLES;
-        float* ray_error_output = &mlp->error_output[ray_start_idx * 4];
+        float* ray_error_output = (float*)malloc(NUM_SAMPLES * 4 * sizeof(float));
         float densities[NUM_SAMPLES], colors[NUM_SAMPLES * 3];
         extract_densities_colors(layer2_output, ray_start_idx, densities, colors);
 
@@ -116,6 +120,9 @@ float process_batch(MLP* mlp, const float* layer2_output, const float* batch_tru
         }
         total_loss += pixel_loss;
         compute_volume_rendering_gradients(densities, colors, pixel_error, ray_error_output);
+        // Copy ray_error_output to mlp->d_error_output on device (deferred for batch)
+        cudaMemcpy(&mlp->d_error_output[(ray_start_idx) * 4], ray_error_output, NUM_SAMPLES * 4 * sizeof(float), cudaMemcpyHostToDevice);
+        free(ray_error_output);
     }
     return total_loss / RAYS_PER_BATCH;
 }
@@ -133,23 +140,28 @@ void render_single_pixel(MLP* temp_mlp, float* ray_X, Camera* cam, int u, int v,
         ray_X[s * 6 + 4] = ray_d[1];
         ray_X[s * 6 + 5] = ray_d[2];
     }
-    forward_pass_mlp(temp_mlp, ray_X);
+    float* d_ray_X;
+    cudaMalloc(&d_ray_X, NUM_SAMPLES * 6 * sizeof(float));
+    cudaMemcpy(d_ray_X, ray_X, NUM_SAMPLES * 6 * sizeof(float), cudaMemcpyHostToDevice);
+    forward_pass_mlp(temp_mlp, d_ray_X);
     float* layer2_output = (float*)malloc(NUM_SAMPLES * 4 * sizeof(float));
     apply_activations_mlp(temp_mlp, layer2_output);
     float densities[NUM_SAMPLES], colors[NUM_SAMPLES * 3];
     extract_densities_colors(layer2_output, 0, densities, colors);
     render_ray(densities, colors, pixel_color);
     free(layer2_output);
+    cudaFree(d_ray_X);
 }
 
 // Render a test image
-void render_test_image(MLP* mlp, Dataset* dataset, int batch_num) {
+void render_test_image(MLP* mlp, Dataset* dataset, int batch_num, cublasHandle_t cublas_handle) {
     printf("  Rendering test image %dx%d...\n", RENDER_WIDTH, RENDER_HEIGHT);
     Camera* cam = dataset->cameras[0];
-    MLP* temp_mlp = init_mlp(mlp->input_dim, mlp->hidden_dim, mlp->output_dim, NUM_SAMPLES);
-    memcpy(temp_mlp->W1, mlp->W1, mlp->hidden_dim * mlp->input_dim * sizeof(float));
-    memcpy(temp_mlp->W2, mlp->W2, mlp->output_dim * mlp->hidden_dim * sizeof(float));
-    memcpy(temp_mlp->W3, mlp->W3, mlp->output_dim * mlp->input_dim * sizeof(float));
+    MLP* temp_mlp = init_mlp(mlp->input_dim, mlp->hidden_dim, mlp->output_dim, NUM_SAMPLES, cublas_handle);
+    // Copy weights from trained model
+    cudaMemcpy(temp_mlp->d_W1, mlp->d_W1, mlp->hidden_dim * mlp->input_dim * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(temp_mlp->d_W2, mlp->d_W2, mlp->output_dim * mlp->hidden_dim * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(temp_mlp->d_W3, mlp->d_W3, mlp->output_dim * mlp->input_dim * sizeof(float), cudaMemcpyDeviceToDevice);
     float* ray_X = (float*)malloc(NUM_SAMPLES * 6 * sizeof(float));
     unsigned char* image_data = (unsigned char*)malloc(RENDER_WIDTH * RENDER_HEIGHT * 3);
 
@@ -177,8 +189,6 @@ void render_test_image(MLP* mlp, Dataset* dataset, int batch_num) {
 
 int main() {
     srand(time(NULL));
-    openblas_set_num_threads(4);
-
     Dataset* dataset = load_dataset("./data/transforms.json", "./data", 100);
 
     const int input_dim = 6;
@@ -186,26 +196,36 @@ int main() {
     const int output_dim = 4;
     const int batch_size = RAYS_PER_BATCH * NUM_SAMPLES;
 
-    MLP* mlp = init_mlp(input_dim, hidden_dim, output_dim, batch_size);
+    // Initialize cuBLAS
+    cublasHandle_t cublas_handle;
+    cublasCreate(&cublas_handle);
+    cublasSetMathMode(cublas_handle, CUBLAS_TENSOR_OP_MATH);
+
+    MLP* mlp = init_mlp(input_dim, hidden_dim, output_dim, batch_size, cublas_handle);
+
     float* batch_X = (float*)malloc(batch_size * input_dim * sizeof(float));
     float* batch_true_colors = (float*)malloc(batch_size * 3 * sizeof(float));
+    float* d_batch_X;
     float* layer2_output = (float*)malloc(batch_size * output_dim * sizeof(float));
+    cudaMalloc(&d_batch_X, batch_size * input_dim * sizeof(float));
 
     const int num_batches = 20000;
     float learning_rate = 0.001f;
 
     for (int batch = 0; batch < num_batches; batch++) {
         generate_random_batch(dataset, RAYS_PER_BATCH, batch_X, batch_true_colors);
-        forward_pass_mlp(mlp, batch_X);
+        cudaMemcpy(d_batch_X, batch_X, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+        forward_pass_mlp(mlp, d_batch_X);
         apply_activations_mlp(mlp, layer2_output);
         zero_gradients_mlp(mlp);
+
         float loss = process_batch(mlp, layer2_output, batch_true_colors);
-        backward_pass_mlp(mlp, batch_X);
+        backward_pass_mlp(mlp, d_batch_X);
         update_weights_mlp(mlp, learning_rate);
 
         if ((batch + 1) % 100 == 0) {
             printf("Batch [%d/%d], Loss: %.6f\n", batch + 1, num_batches, loss);
-            if ((batch + 1) % 5000 == 0) render_test_image(mlp, dataset, batch + 1);
+            if ((batch + 1) % 5000 == 0) render_test_image(mlp, dataset, batch + 1, cublas_handle);
         }
     }
     char model_filename[64];
@@ -220,6 +240,8 @@ int main() {
     free(batch_true_colors);
     free(layer2_output);
     free_mlp(mlp);
+    cudaFree(d_batch_X);
+    cublasDestroy(cublas_handle);
 
     return 0;
 }
