@@ -11,13 +11,30 @@
 #define RENDER_WIDTH 128
 #define RENDER_HEIGHT 128
 
+// Activation functions
+static inline float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+static inline float sigmoid_derivative(float sigmoid_val) {
+    return sigmoid_val * (1.0f - sigmoid_val);
+}
+
+static inline float relu(float x) {
+    return fmaxf(0.0f, x);
+}
+
+static inline float relu_derivative(float x) {
+    return x > 0.0f ? 1.0f : 0.0f;
+}
+
 // Volume rendering: integrate densities and colors along ray
 void render_ray(float* densities, float* colors, float* pixel_color) {
     pixel_color[0] = pixel_color[1] = pixel_color[2] = 0.0f;
     float transmittance = 1.0f;
     
     for (int i = 0; i < NUM_SAMPLES; i++) {
-        float density = fmaxf(0.0f, densities[i]);
+        float density = densities[i];
         float alpha = 1.0f - expf(-density * 0.01f);
         float weight = alpha * transmittance;
         
@@ -41,10 +58,10 @@ void compute_volume_rendering_gradients(float* mlp_output, float* pixel_error,
     
     // Process MLP outputs
     for (int s = 0; s < NUM_SAMPLES; s++) {
-        densities[s] = fmaxf(0.0f, mlp_output[s * 4]);
-        colors[s * 3 + 0] = 1.0f / (1.0f + expf(-mlp_output[s * 4 + 1]));
-        colors[s * 3 + 1] = 1.0f / (1.0f + expf(-mlp_output[s * 4 + 2]));
-        colors[s * 3 + 2] = 1.0f / (1.0f + expf(-mlp_output[s * 4 + 3]));
+        densities[s] = relu(mlp_output[s * 4]);
+        colors[s * 3 + 0] = sigmoid(mlp_output[s * 4 + 1]);
+        colors[s * 3 + 1] = sigmoid(mlp_output[s * 4 + 2]);
+        colors[s * 3 + 2] = sigmoid(mlp_output[s * 4 + 3]);
         alphas[s] = 1.0f - expf(-densities[s] * 0.01f);
     }
     
@@ -62,41 +79,42 @@ void compute_volume_rendering_gradients(float* mlp_output, float* pixel_error,
         // Color gradients with sigmoid derivative
         for (int c = 0; c < 3; c++) {
             float sigmoid_val = colors[s * 3 + c];
-            float sigmoid_deriv = sigmoid_val * (1.0f - sigmoid_val);
+            float sigmoid_deriv = sigmoid_derivative(sigmoid_val);
             mlp_error_output[s * 4 + 1 + c] = weights[s] * pixel_error[c] * sigmoid_deriv;
         }
         
-        // Density gradient
+        // Density gradient with ReLU derivative
         float density_gradient = 0.0f;
         
-        if (mlp_output[s * 4] > 0.0f) {
-            float dalpha_ddensity = 0.01f * expf(-densities[s] * 0.01f);
-            
-            // Direct contribution
-            float dweight_ddensity = dalpha_ddensity * transmittance[s];
-            density_gradient += dweight_ddensity * (
-                pixel_error[0] * colors[s * 3 + 0] + 
-                pixel_error[1] * colors[s * 3 + 1] + 
-                pixel_error[2] * colors[s * 3 + 2]
-            );
-            
-            // Indirect contribution through transmittance
-            for (int t = s + 1; t < NUM_SAMPLES; t++) {
-                float dtransmittance_ddensity = -dalpha_ddensity;
-                for (int k = s + 1; k <= t; k++) {
-                    dtransmittance_ddensity *= (1.0f - alphas[k-1]);
-                }
-                
-                float dweight_t_ddensity = alphas[t] * dtransmittance_ddensity;
-                density_gradient += dweight_t_ddensity * (
-                    pixel_error[0] * colors[t * 3 + 0] + 
-                    pixel_error[1] * colors[t * 3 + 1] + 
-                    pixel_error[2] * colors[t * 3 + 2]
-                );
+        // Compute density_gradient
+        float dalpha_ddensity = 0.01f * expf(-densities[s] * 0.01f);
+        
+        // Direct contribution
+        float dweight_ddensity = dalpha_ddensity * transmittance[s];
+        density_gradient += dweight_ddensity * (
+            pixel_error[0] * colors[s * 3 + 0] + 
+            pixel_error[1] * colors[s * 3 + 1] + 
+            pixel_error[2] * colors[s * 3 + 2]
+        );
+        
+        // Indirect contribution through transmittance
+        for (int t = s + 1; t < NUM_SAMPLES; t++) {
+            float dtransmittance_ddensity = -dalpha_ddensity;
+            for (int k = s + 1; k <= t; k++) {
+                dtransmittance_ddensity *= (1.0f - alphas[k-1]);
             }
+            
+            float dweight_t_ddensity = alphas[t] * dtransmittance_ddensity;
+            density_gradient += dweight_t_ddensity * (
+                pixel_error[0] * colors[t * 3 + 0] + 
+                pixel_error[1] * colors[t * 3 + 1] + 
+                pixel_error[2] * colors[t * 3 + 2]
+            );
         }
         
-        mlp_error_output[s * 4 + 0] = density_gradient;
+        // Apply ReLU derivative
+        float relu_deriv = relu_derivative(mlp_output[s * 4]);
+        mlp_error_output[s * 4 + 0] = density_gradient * relu_deriv;
     }
 }
 
@@ -114,10 +132,10 @@ float process_batch(MLP* mlp, float* batch_true_colors) {
         float colors[NUM_SAMPLES * 3];
         
         for (int s = 0; s < NUM_SAMPLES; s++) {
-            densities[s] = fmaxf(0.0f, ray_mlp_output[s * 4]);
-            colors[s * 3 + 0] = 1.0f / (1.0f + expf(-ray_mlp_output[s * 4 + 1]));
-            colors[s * 3 + 1] = 1.0f / (1.0f + expf(-ray_mlp_output[s * 4 + 2]));
-            colors[s * 3 + 2] = 1.0f / (1.0f + expf(-ray_mlp_output[s * 4 + 3]));
+            densities[s] = relu(ray_mlp_output[s * 4]);
+            colors[s * 3 + 0] = sigmoid(ray_mlp_output[s * 4 + 1]);
+            colors[s * 3 + 1] = sigmoid(ray_mlp_output[s * 4 + 2]);
+            colors[s * 3 + 2] = sigmoid(ray_mlp_output[s * 4 + 3]);
         }
         
         // Render pixel
@@ -170,10 +188,10 @@ void render_single_pixel(MLP* temp_mlp, float* ray_X, Camera* cam, int u, int v,
     float colors[NUM_SAMPLES * 3];
     
     for (int s = 0; s < NUM_SAMPLES; s++) {
-        densities[s] = fmaxf(0.0f, temp_mlp->layer2_output[s * 4]);
-        colors[s * 3 + 0] = 1.0f / (1.0f + expf(-temp_mlp->layer2_output[s * 4 + 1]));
-        colors[s * 3 + 1] = 1.0f / (1.0f + expf(-temp_mlp->layer2_output[s * 4 + 2]));
-        colors[s * 3 + 2] = 1.0f / (1.0f + expf(-temp_mlp->layer2_output[s * 4 + 3]));
+        densities[s] = relu(temp_mlp->layer2_output[s * 4]);
+        colors[s * 3 + 0] = sigmoid(temp_mlp->layer2_output[s * 4 + 1]);
+        colors[s * 3 + 1] = sigmoid(temp_mlp->layer2_output[s * 4 + 2]);
+        colors[s * 3 + 2] = sigmoid(temp_mlp->layer2_output[s * 4 + 3]);
     }
     
     // Render the ray
@@ -247,10 +265,10 @@ void print_sample_predictions(MLP* mlp, float* batch_true_colors) {
         
         float densities[NUM_SAMPLES], colors[NUM_SAMPLES * 3];
         for (int s = 0; s < NUM_SAMPLES; s++) {
-            densities[s] = fmaxf(0.0f, ray_output[s * 4]);
-            colors[s * 3 + 0] = 1.0f / (1.0f + expf(-ray_output[s * 4 + 1]));
-            colors[s * 3 + 1] = 1.0f / (1.0f + expf(-ray_output[s * 4 + 2]));
-            colors[s * 3 + 2] = 1.0f / (1.0f + expf(-ray_output[s * 4 + 3]));
+            densities[s] = relu(ray_output[s * 4]);
+            colors[s * 3 + 0] = sigmoid(ray_output[s * 4 + 1]);
+            colors[s * 3 + 1] = sigmoid(ray_output[s * 4 + 2]);
+            colors[s * 3 + 2] = sigmoid(ray_output[s * 4 + 3]);
         }
         
         float pixel_color[3];
