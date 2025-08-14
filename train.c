@@ -13,31 +13,28 @@
 #define RENDER_HEIGHT 128
 
 // --- Positional Encoding Parameters ---
-#define POS_ENC_L 10 // Number of frequency bands for position (typically 10 for NeRF)
-#define DIR_ENC_L 4  // Number of frequency bands for direction (typically 4 for NeRF)
+#define POS_ENC_L 10
+#define DIR_ENC_L 4
 #define INPUT_POS_DIM 3
 #define INPUT_DIR_DIM 3
 
 #define RAW_INPUT_DIM 6
-#define POS_ENC_DIM (INPUT_POS_DIM * (2 * POS_ENC_L) + INPUT_POS_DIM) // 3 + 3*2*10 = 3 + 60 = 63
-#define DIR_ENC_DIM (INPUT_DIR_DIM * (2 * DIR_ENC_L) + INPUT_DIR_DIM) // 3 + 3*2*4 = 3 + 24 = 27
-#define PE_INPUT_DIM (POS_ENC_DIM + DIR_ENC_DIM) // 63 + 27 = 90
+#define POS_ENC_DIM (INPUT_POS_DIM * (2 * POS_ENC_L) + INPUT_POS_DIM) // 63
+#define DIR_ENC_DIM (INPUT_DIR_DIM * (2 * DIR_ENC_L) + INPUT_DIR_DIM) // 27
+#define PE_INPUT_DIM (POS_ENC_DIM + DIR_ENC_DIM) // 90
 
 // CUDA kernel for activations (output_dim=4: density, rgb)
 __global__ void activation_kernel(float* d_layer2_preact, float* d_layer2_output, int batch_size, int output_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < batch_size) {
         int base = idx * output_dim;
-        // Density: ReLU
         d_layer2_output[base + 0] = fmaxf(0.0f, d_layer2_preact[base + 0]);
-        // RGB: Sigmoid
         for (int c = 1; c < 4; c++) {
             d_layer2_output[base + c] = 1.0f / (1.0f + expf(-d_layer2_preact[base + c]));
         }
     }
 }
 
-// CUDA kernel to extract densities and colors per sample
 __global__ void extract_densities_colors_kernel(const float* d_layer2_output, float* d_densities, float* d_colors, int batch_size, int output_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < batch_size) {
@@ -49,16 +46,9 @@ __global__ void extract_densities_colors_kernel(const float* d_layer2_output, fl
     }
 }
 
-// ---- Positional Encoding CPU implementation ----
 void positional_encoding(const float* input, int input_dim, int L, float* output) {
-    // input: [x, y, z] or [dx, dy, dz]
-    // output: [x, y, z, sin(2^0 pi x), cos(2^0 pi x), ..., sin(2^{L-1} pi x), cos(2^{L-1} pi x), ...]
     int out_idx = 0;
-    // Copy raw input
-    for (int i = 0; i < input_dim; i++) {
-        output[out_idx++] = input[i];
-    }
-    // Frequencies
+    for (int i = 0; i < input_dim; i++) output[out_idx++] = input[i];
     for (int l = 0; l < L; l++) {
         float freq = powf(2.0f, (float)l);
         for (int i = 0; i < input_dim; i++) {
@@ -68,10 +58,7 @@ void positional_encoding(const float* input, int input_dim, int L, float* output
     }
 }
 
-// Batch positional encoding for all samples (for NUM_SAMPLES * rays)
 void batch_positional_encoding(const float* batch_X, int num_samples, int rays_per_batch, float* batch_pe_X) {
-    // batch_X: [NUM_SAMPLES * rays_per_batch, 6]
-    // batch_pe_X: [NUM_SAMPLES * rays_per_batch, PE_INPUT_DIM]
     for (int idx = 0; idx < num_samples * rays_per_batch; idx++) {
         const float* pos = &batch_X[idx * 6 + 0];
         const float* dir = &batch_X[idx * 6 + 3];
@@ -81,7 +68,6 @@ void batch_positional_encoding(const float* batch_X, int num_samples, int rays_p
     }
 }
 
-// CUDA kernel for volume rendering and loss computation
 __global__ void volume_rendering_and_loss_kernel(
     const float* d_densities, const float* d_colors,
     const float* d_true_colors,
@@ -101,10 +87,8 @@ __global__ void volume_rendering_and_loss_kernel(
             transmittance *= (1.0f - alpha);
             if (transmittance < 0.01f) break;
         }
-        // Write predicted color
         for (int c = 0; c < 3; c++)
             d_pixel_colors[ray * 3 + c] = pixel_color[c];
-        // Compute error and accumulate loss
         float pixel_loss = 0.0f;
         for (int c = 0; c < 3; c++) {
             float error = pixel_color[c] - d_true_colors[ray * num_samples * 3 + c];
@@ -115,7 +99,6 @@ __global__ void volume_rendering_and_loss_kernel(
     }
 }
 
-// CUDA kernel for volume rendering gradient computation (for each ray)
 __global__ void volume_rendering_gradient_kernel(
     const float* d_densities, const float* d_colors,
     const float* d_pixel_errors,
@@ -137,14 +120,12 @@ __global__ void volume_rendering_gradient_kernel(
             weights[s] = alphas[s] * transmittance[s];
         }
         for (int s = 0; s < num_samples; s++) {
-            // Color gradients (sigmoid derivative)
             for (int c = 0; c < 3; c++) {
                 float sigmoid_val = d_colors[(ray * num_samples + s) * 3 + c];
                 float sigmoid_deriv = sigmoid_val * (1.0f - sigmoid_val);
                 float grad = weights[s] * d_pixel_errors[ray * 3 + c] * sigmoid_deriv;
                 d_mlp_error_output[(ray * num_samples + s) * 4 + 1 + c] = grad;
             }
-            // Density gradient (ReLU derivative)
             float density = d_densities[ray * num_samples + s];
             float dalpha_ddensity = 0.01f * expf(-density * 0.01f);
             float density_gradient = dalpha_ddensity * transmittance[s] *
@@ -167,10 +148,61 @@ __global__ void volume_rendering_gradient_kernel(
     }
 }
 
-// Full implementation of render_test_image
+// Interpolate between two cameras for plausible novel views
+void interpolate_cameras(Camera* cam_a, Camera* cam_b, float alpha, Camera* out_cam) {
+    for (int i = 0; i < 3; i++) {
+        out_cam->position[i] = (1.0f - alpha) * cam_a->position[i] + alpha * cam_b->position[i];
+    }
+    // For rotation: slerp is ideal, but we'll do simple lerp then normalize columns
+    for (int i = 0; i < 9; i++) {
+        out_cam->rotation[i] = (1.0f - alpha) * cam_a->rotation[i] + alpha * cam_b->rotation[i];
+    }
+    // Re-orthogonalize rotation matrix (Gram-Schmidt, simple version)
+    // Columns are right (0,3,6), up (1,4,7), forward (2,5,8)
+    float r[3] = {out_cam->rotation[0], out_cam->rotation[3], out_cam->rotation[6]};
+    float u[3] = {out_cam->rotation[1], out_cam->rotation[4], out_cam->rotation[7]};
+    float f[3] = {out_cam->rotation[2], out_cam->rotation[5], out_cam->rotation[8]};
+    // Normalize forward
+    float fnorm = sqrtf(f[0]*f[0] + f[1]*f[1] + f[2]*f[2]);
+    for (int i=0;i<3;i++) f[i] /= fnorm;
+    // Orthogonalize up
+    float dot_uf = u[0]*f[0] + u[1]*f[1] + u[2]*f[2];
+    for (int i=0;i<3;i++) u[i] -= dot_uf * f[i];
+    float unorm = sqrtf(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]);
+    for (int i=0;i<3;i++) u[i] /= unorm;
+    // Compute right as cross(up, forward)
+    r[0] = u[1]*f[2] - u[2]*f[1];
+    r[1] = u[2]*f[0] - u[0]*f[2];
+    r[2] = u[0]*f[1] - u[1]*f[0];
+    // Normalize right
+    float rnorm = sqrtf(r[0]*r[0] + r[1]*r[1] + r[2]*r[2]);
+    for (int i=0;i<3;i++) r[i] /= rnorm;
+    // Store back
+    out_cam->rotation[0]=r[0]; out_cam->rotation[3]=r[1]; out_cam->rotation[6]=r[2];
+    out_cam->rotation[1]=u[0]; out_cam->rotation[4]=u[1]; out_cam->rotation[7]=u[2];
+    out_cam->rotation[2]=f[0]; out_cam->rotation[5]=f[1]; out_cam->rotation[8]=f[2];
+
+    out_cam->focal = (1.0f-alpha) * cam_a->focal + alpha * cam_b->focal;
+    out_cam->width = cam_a->width;
+    out_cam->height = cam_a->height;
+}
+
+// Always interpolate between two random training cameras for novel view
+void generate_interpolated_camera(Dataset* dataset, Camera* out_cam) {
+    int cam_a_idx = rand() % dataset->num_images;
+    int cam_b_idx = rand() % dataset->num_images;
+    while (cam_b_idx == cam_a_idx) cam_b_idx = rand() % dataset->num_images;
+    float alpha = (float)rand() / RAND_MAX;
+    interpolate_cameras(dataset->cameras[cam_a_idx], dataset->cameras[cam_b_idx], alpha, out_cam);
+}
+
+// Full implementation of render_test_image with interpolated camera
 void render_test_image(MLP* mlp, Dataset* dataset, int batch_num, cublasHandle_t cublas_handle) {
-    printf("  Rendering test image %dx%d...\n", RENDER_WIDTH, RENDER_HEIGHT);
-    Camera* cam = dataset->cameras[0];
+    printf("  Rendering test image %dx%d with interpolated view...\n", RENDER_WIDTH, RENDER_HEIGHT);
+
+    Camera novel_cam;
+    generate_interpolated_camera(dataset, &novel_cam);
+
     MLP* temp_mlp = init_mlp(mlp->input_dim, mlp->hidden_dim, mlp->output_dim, NUM_SAMPLES, cublas_handle);
     cudaMemcpy(temp_mlp->d_W1, mlp->d_W1, mlp->hidden_dim * mlp->input_dim * sizeof(float), cudaMemcpyDeviceToDevice);
     cudaMemcpy(temp_mlp->d_W2, mlp->d_W2, mlp->output_dim * mlp->hidden_dim * sizeof(float), cudaMemcpyDeviceToDevice);
@@ -180,7 +212,6 @@ void render_test_image(MLP* mlp, Dataset* dataset, int batch_num, cublasHandle_t
     float* ray_PE_X = (float*)malloc(NUM_SAMPLES * PE_INPUT_DIM * sizeof(float));
     unsigned char* image_data = (unsigned char*)malloc(RENDER_WIDTH * RENDER_HEIGHT * 3);
 
-    // Buffers for CUDA pipeline
     float* d_ray_PE_X;
     float* d_layer2_output;
     float* d_densities;
@@ -192,10 +223,10 @@ void render_test_image(MLP* mlp, Dataset* dataset, int batch_num, cublasHandle_t
 
     for (int v = 0; v < RENDER_HEIGHT; v++) {
         for (int u = 0; u < RENDER_WIDTH; u++) {
-            int scaled_u = (int)(u * (float)cam->width / RENDER_WIDTH);
-            int scaled_v = (int)(v * (float)cam->height / RENDER_HEIGHT);
+            int scaled_u = (int)(u * (float)novel_cam.width / RENDER_WIDTH);
+            int scaled_v = (int)(v * (float)novel_cam.height / RENDER_HEIGHT);
             float ray_o[3], ray_d[3];
-            generate_ray(cam, scaled_u, scaled_v, ray_o, ray_d);
+            generate_ray(&novel_cam, scaled_u, scaled_v, ray_o, ray_d);
             for (int s = 0; s < NUM_SAMPLES; s++) {
                 float t = NEAR_PLANE + (FAR_PLANE - NEAR_PLANE) * s / (NUM_SAMPLES - 1);
                 ray_X[s * 6 + 0] = ray_o[0] + t * ray_d[0];
@@ -205,7 +236,6 @@ void render_test_image(MLP* mlp, Dataset* dataset, int batch_num, cublasHandle_t
                 ray_X[s * 6 + 4] = ray_d[1];
                 ray_X[s * 6 + 5] = ray_d[2];
             }
-            // Positional encoding
             batch_positional_encoding(ray_X, NUM_SAMPLES, 1, ray_PE_X);
             cudaMemcpy(d_ray_PE_X, ray_PE_X, NUM_SAMPLES * PE_INPUT_DIM * sizeof(float), cudaMemcpyHostToDevice);
 
@@ -216,7 +246,6 @@ void render_test_image(MLP* mlp, Dataset* dataset, int batch_num, cublasHandle_t
             activation_kernel<<<num_blocks, block_size>>>(temp_mlp->d_layer2_preact, d_layer2_output, NUM_SAMPLES, temp_mlp->output_dim);
             extract_densities_colors_kernel<<<num_blocks, block_size>>>(d_layer2_output, d_densities, d_colors, NUM_SAMPLES, temp_mlp->output_dim);
 
-            // Copy to host for rendering
             float densities[NUM_SAMPLES], colors[NUM_SAMPLES * 3];
             cudaMemcpy(densities, d_densities, NUM_SAMPLES * sizeof(float), cudaMemcpyDeviceToHost);
             cudaMemcpy(colors, d_colors, NUM_SAMPLES * 3 * sizeof(float), cudaMemcpyDeviceToHost);
@@ -257,19 +286,17 @@ int main() {
     srand(time(NULL));
     Dataset* dataset = load_dataset("./data/transforms.json", "./data", 100);
 
-    const int input_dim = PE_INPUT_DIM; // Use encoded input dimension
+    const int input_dim = PE_INPUT_DIM;
     const int hidden_dim = 1024;
     const int output_dim = 4;
     const int batch_size = RAYS_PER_BATCH * NUM_SAMPLES;
 
-    // Initialize cuBLAS
     cublasHandle_t cublas_handle;
     cublasCreate(&cublas_handle);
     cublasSetMathMode(cublas_handle, CUBLAS_TENSOR_OP_MATH);
 
     MLP* mlp = init_mlp(input_dim, hidden_dim, output_dim, batch_size, cublas_handle);
 
-    // Allocate host and device memory for batch
     float* batch_X = (float*)malloc(batch_size * RAW_INPUT_DIM * sizeof(float));
     float* batch_PE_X = (float*)malloc(batch_size * PE_INPUT_DIM * sizeof(float));
     float* batch_true_colors = (float*)malloc(batch_size * 3 * sizeof(float));
@@ -278,7 +305,6 @@ int main() {
     cudaMalloc(&d_batch_PE_X, batch_size * PE_INPUT_DIM * sizeof(float));
     cudaMalloc(&d_batch_true_colors, batch_size * 3 * sizeof(float));
 
-    // Device memory for activations, densities, colors, predicted pixel colors, pixel errors, loss
     float* d_layer2_output;
     float* d_densities;
     float* d_colors;
@@ -292,7 +318,7 @@ int main() {
     cudaMalloc(&d_pixel_errors, RAYS_PER_BATCH * 3 * sizeof(float));
     cudaMalloc(&d_loss_accum, sizeof(float));
 
-    float* d_mlp_error_output = mlp->d_error_output; // Use directly
+    float* d_mlp_error_output = mlp->d_error_output;
 
     const int num_batches = 20000;
     float learning_rate = 0.001f;
@@ -303,21 +329,16 @@ int main() {
         cudaMemcpy(d_batch_PE_X, batch_PE_X, batch_size * PE_INPUT_DIM * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(d_batch_true_colors, batch_true_colors, batch_size * 3 * sizeof(float), cudaMemcpyHostToDevice);
 
-        // Forward pass
         forward_pass_mlp(mlp, d_batch_PE_X);
 
-        // Activation (on GPU)
         int block_size = 256;
         int num_blocks = (batch_size + block_size - 1) / block_size;
         activation_kernel<<<num_blocks, block_size>>>(mlp->d_layer2_preact, d_layer2_output, batch_size, output_dim);
 
-        // Extract densities/colors
         extract_densities_colors_kernel<<<num_blocks, block_size>>>(d_layer2_output, d_densities, d_colors, batch_size, output_dim);
 
-        // Zero gradients
         zero_gradients_mlp(mlp);
 
-        // Volume rendering and loss computation (per ray)
         cudaMemset(d_loss_accum, 0, sizeof(float));
         int ray_block_size = 64;
         int ray_num_blocks = (RAYS_PER_BATCH + ray_block_size - 1) / ray_block_size;
@@ -325,16 +346,13 @@ int main() {
             d_densities, d_colors, d_batch_true_colors,
             d_pixel_colors, d_pixel_errors, d_loss_accum, RAYS_PER_BATCH, NUM_SAMPLES);
 
-        // Volume rendering gradient computation (per ray)
         volume_rendering_gradient_kernel<<<ray_num_blocks, ray_block_size>>>(
             d_densities, d_colors, d_pixel_errors,
             d_mlp_error_output, RAYS_PER_BATCH, NUM_SAMPLES);
 
-        // Backward pass
         backward_pass_mlp(mlp, d_batch_PE_X);
         update_weights_mlp(mlp, learning_rate);
 
-        // Copy loss to host and print
         float total_loss = 0.0f;
         cudaMemcpy(&total_loss, d_loss_accum, sizeof(float), cudaMemcpyDeviceToHost);
         total_loss /= RAYS_PER_BATCH;
