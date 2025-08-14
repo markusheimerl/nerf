@@ -57,3 +57,4 @@ dkms.conf
 *.csv
 *.bin
 *_sample.png
+screenlog.0

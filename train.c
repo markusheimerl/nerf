@@ -192,7 +192,7 @@ void generate_interpolated_camera(Dataset* dataset, Camera* out_cam) {
     int cam_a_idx = rand() % dataset->num_images;
     int cam_b_idx = rand() % dataset->num_images;
     while (cam_b_idx == cam_a_idx) cam_b_idx = rand() % dataset->num_images;
-    float alpha = (float)rand() / RAND_MAX;
+    float alpha = (float)rand() / (float)RAND_MAX;
     interpolate_cameras(dataset->cameras[cam_a_idx], dataset->cameras[cam_b_idx], alpha, out_cam);
 }
 
@@ -287,7 +287,7 @@ int main() {
     Dataset* dataset = load_dataset("./data/transforms.json", "./data", 100);
 
     const int input_dim = PE_INPUT_DIM;
-    const int hidden_dim = 1024;
+    const int hidden_dim = 8192;
     const int output_dim = 4;
     const int batch_size = RAYS_PER_BATCH * NUM_SAMPLES;
 
@@ -357,7 +357,7 @@ int main() {
         cudaMemcpy(&total_loss, d_loss_accum, sizeof(float), cudaMemcpyDeviceToHost);
         total_loss /= RAYS_PER_BATCH;
 
-        if ((batch + 1) % 100 == 0) {
+        if ((batch + 1) % 10 == 0) {
             printf("Batch [%d/%d], Loss: %.6f\n", batch + 1, num_batches, total_loss);
             if ((batch + 1) % 5000 == 0) render_test_image(mlp, dataset, batch + 1, cublas_handle);
         }
