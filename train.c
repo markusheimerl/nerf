@@ -12,6 +12,17 @@
 #define RENDER_WIDTH 128
 #define RENDER_HEIGHT 128
 
+// --- Positional Encoding Parameters ---
+#define POS_ENC_L 10 // Number of frequency bands for position (typically 10 for NeRF)
+#define DIR_ENC_L 4  // Number of frequency bands for direction (typically 4 for NeRF)
+#define INPUT_POS_DIM 3
+#define INPUT_DIR_DIM 3
+
+#define RAW_INPUT_DIM 6
+#define POS_ENC_DIM (INPUT_POS_DIM * (2 * POS_ENC_L) + INPUT_POS_DIM) // 3 + 3*2*10 = 3 + 60 = 63
+#define DIR_ENC_DIM (INPUT_DIR_DIM * (2 * DIR_ENC_L) + INPUT_DIR_DIM) // 3 + 3*2*4 = 3 + 24 = 27
+#define PE_INPUT_DIM (POS_ENC_DIM + DIR_ENC_DIM) // 63 + 27 = 90
+
 // CUDA kernel for activations (output_dim=4: density, rgb)
 __global__ void activation_kernel(float* d_layer2_preact, float* d_layer2_output, int batch_size, int output_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -38,6 +49,38 @@ __global__ void extract_densities_colors_kernel(const float* d_layer2_output, fl
     }
 }
 
+// ---- Positional Encoding CPU implementation ----
+void positional_encoding(const float* input, int input_dim, int L, float* output) {
+    // input: [x, y, z] or [dx, dy, dz]
+    // output: [x, y, z, sin(2^0 pi x), cos(2^0 pi x), ..., sin(2^{L-1} pi x), cos(2^{L-1} pi x), ...]
+    int out_idx = 0;
+    // Copy raw input
+    for (int i = 0; i < input_dim; i++) {
+        output[out_idx++] = input[i];
+    }
+    // Frequencies
+    for (int l = 0; l < L; l++) {
+        float freq = powf(2.0f, (float)l);
+        for (int i = 0; i < input_dim; i++) {
+            output[out_idx++] = sinf(freq * M_PI * input[i]);
+            output[out_idx++] = cosf(freq * M_PI * input[i]);
+        }
+    }
+}
+
+// Batch positional encoding for all samples (for NUM_SAMPLES * rays)
+void batch_positional_encoding(const float* batch_X, int num_samples, int rays_per_batch, float* batch_pe_X) {
+    // batch_X: [NUM_SAMPLES * rays_per_batch, 6]
+    // batch_pe_X: [NUM_SAMPLES * rays_per_batch, PE_INPUT_DIM]
+    for (int idx = 0; idx < num_samples * rays_per_batch; idx++) {
+        const float* pos = &batch_X[idx * 6 + 0];
+        const float* dir = &batch_X[idx * 6 + 3];
+        float* out = &batch_pe_X[idx * PE_INPUT_DIM];
+        positional_encoding(pos, INPUT_POS_DIM, POS_ENC_L, out);
+        positional_encoding(dir, INPUT_DIR_DIM, DIR_ENC_L, out + POS_ENC_DIM);
+    }
+}
+
 // CUDA kernel for volume rendering and loss computation
 __global__ void volume_rendering_and_loss_kernel(
     const float* d_densities, const float* d_colors,
@@ -49,12 +92,10 @@ __global__ void volume_rendering_and_loss_kernel(
     if (ray < rays_per_batch) {
         float pixel_color[3] = {0.0f, 0.0f, 0.0f};
         float transmittance = 1.0f;
-        float weights[NUM_SAMPLES];
         for (int s = 0; s < num_samples; s++) {
             float density = d_densities[ray * num_samples + s];
             float alpha = 1.0f - expf(-density * 0.01f);
             float weight = alpha * transmittance;
-            weights[s] = weight;
             for (int c = 0; c < 3; c++)
                 pixel_color[c] += weight * d_colors[(ray * num_samples + s) * 3 + c];
             transmittance *= (1.0f - alpha);
@@ -134,15 +175,17 @@ void render_test_image(MLP* mlp, Dataset* dataset, int batch_num, cublasHandle_t
     cudaMemcpy(temp_mlp->d_W1, mlp->d_W1, mlp->hidden_dim * mlp->input_dim * sizeof(float), cudaMemcpyDeviceToDevice);
     cudaMemcpy(temp_mlp->d_W2, mlp->d_W2, mlp->output_dim * mlp->hidden_dim * sizeof(float), cudaMemcpyDeviceToDevice);
     cudaMemcpy(temp_mlp->d_W3, mlp->d_W3, mlp->output_dim * mlp->input_dim * sizeof(float), cudaMemcpyDeviceToDevice);
-    float* ray_X = (float*)malloc(NUM_SAMPLES * 6 * sizeof(float));
+
+    float* ray_X = (float*)malloc(NUM_SAMPLES * RAW_INPUT_DIM * sizeof(float));
+    float* ray_PE_X = (float*)malloc(NUM_SAMPLES * PE_INPUT_DIM * sizeof(float));
     unsigned char* image_data = (unsigned char*)malloc(RENDER_WIDTH * RENDER_HEIGHT * 3);
 
     // Buffers for CUDA pipeline
-    float* d_ray_X;
+    float* d_ray_PE_X;
     float* d_layer2_output;
     float* d_densities;
     float* d_colors;
-    cudaMalloc(&d_ray_X, NUM_SAMPLES * 6 * sizeof(float));
+    cudaMalloc(&d_ray_PE_X, NUM_SAMPLES * PE_INPUT_DIM * sizeof(float));
     cudaMalloc(&d_layer2_output, NUM_SAMPLES * 4 * sizeof(float));
     cudaMalloc(&d_densities, NUM_SAMPLES * sizeof(float));
     cudaMalloc(&d_colors, NUM_SAMPLES * 3 * sizeof(float));
@@ -162,8 +205,11 @@ void render_test_image(MLP* mlp, Dataset* dataset, int batch_num, cublasHandle_t
                 ray_X[s * 6 + 4] = ray_d[1];
                 ray_X[s * 6 + 5] = ray_d[2];
             }
-            cudaMemcpy(d_ray_X, ray_X, NUM_SAMPLES * 6 * sizeof(float), cudaMemcpyHostToDevice);
-            forward_pass_mlp(temp_mlp, d_ray_X);
+            // Positional encoding
+            batch_positional_encoding(ray_X, NUM_SAMPLES, 1, ray_PE_X);
+            cudaMemcpy(d_ray_PE_X, ray_PE_X, NUM_SAMPLES * PE_INPUT_DIM * sizeof(float), cudaMemcpyHostToDevice);
+
+            forward_pass_mlp(temp_mlp, d_ray_PE_X);
 
             int block_size = 64;
             int num_blocks = (NUM_SAMPLES + block_size - 1) / block_size;
@@ -199,8 +245,9 @@ void render_test_image(MLP* mlp, Dataset* dataset, int batch_num, cublasHandle_t
 
     free(image_data);
     free(ray_X);
+    free(ray_PE_X);
     free_mlp(temp_mlp);
-    cudaFree(d_ray_X);
+    cudaFree(d_ray_PE_X);
     cudaFree(d_layer2_output);
     cudaFree(d_densities);
     cudaFree(d_colors);
@@ -210,7 +257,7 @@ int main() {
     srand(time(NULL));
     Dataset* dataset = load_dataset("./data/transforms.json", "./data", 100);
 
-    const int input_dim = 6;
+    const int input_dim = PE_INPUT_DIM; // Use encoded input dimension
     const int hidden_dim = 1024;
     const int output_dim = 4;
     const int batch_size = RAYS_PER_BATCH * NUM_SAMPLES;
@@ -223,11 +270,12 @@ int main() {
     MLP* mlp = init_mlp(input_dim, hidden_dim, output_dim, batch_size, cublas_handle);
 
     // Allocate host and device memory for batch
-    float* batch_X = (float*)malloc(batch_size * input_dim * sizeof(float));
+    float* batch_X = (float*)malloc(batch_size * RAW_INPUT_DIM * sizeof(float));
+    float* batch_PE_X = (float*)malloc(batch_size * PE_INPUT_DIM * sizeof(float));
     float* batch_true_colors = (float*)malloc(batch_size * 3 * sizeof(float));
-    float* d_batch_X;
+    float* d_batch_PE_X;
     float* d_batch_true_colors;
-    cudaMalloc(&d_batch_X, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_batch_PE_X, batch_size * PE_INPUT_DIM * sizeof(float));
     cudaMalloc(&d_batch_true_colors, batch_size * 3 * sizeof(float));
 
     // Device memory for activations, densities, colors, predicted pixel colors, pixel errors, loss
@@ -251,11 +299,12 @@ int main() {
 
     for (int batch = 0; batch < num_batches; batch++) {
         generate_random_batch(dataset, RAYS_PER_BATCH, batch_X, batch_true_colors);
-        cudaMemcpy(d_batch_X, batch_X, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+        batch_positional_encoding(batch_X, NUM_SAMPLES, RAYS_PER_BATCH, batch_PE_X);
+        cudaMemcpy(d_batch_PE_X, batch_PE_X, batch_size * PE_INPUT_DIM * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(d_batch_true_colors, batch_true_colors, batch_size * 3 * sizeof(float), cudaMemcpyHostToDevice);
 
         // Forward pass
-        forward_pass_mlp(mlp, d_batch_X);
+        forward_pass_mlp(mlp, d_batch_PE_X);
 
         // Activation (on GPU)
         int block_size = 256;
@@ -282,7 +331,7 @@ int main() {
             d_mlp_error_output, RAYS_PER_BATCH, NUM_SAMPLES);
 
         // Backward pass
-        backward_pass_mlp(mlp, d_batch_X);
+        backward_pass_mlp(mlp, d_batch_PE_X);
         update_weights_mlp(mlp, learning_rate);
 
         // Copy loss to host and print
@@ -305,9 +354,10 @@ int main() {
 
     free_dataset(dataset);
     free(batch_X);
+    free(batch_PE_X);
     free(batch_true_colors);
     free_mlp(mlp);
-    cudaFree(d_batch_X);
+    cudaFree(d_batch_PE_X);
     cudaFree(d_batch_true_colors);
     cudaFree(d_layer2_output);
     cudaFree(d_densities);
