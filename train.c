@@ -5,8 +5,8 @@
 #include <time.h>
 #include <cblas.h>
 #include "mlp/mlp.h"
+#include "data.h"
 
-#define NUM_SAMPLES 64
 #define RAYS_PER_BATCH 8
 
 // Volume rendering: integrate densities and colors along ray
@@ -98,80 +98,6 @@ void compute_volume_rendering_gradients(float* mlp_output, float* pixel_error,
     }
 }
 
-// Load training data from CSV
-int load_training_data(const char* filename, float** X, float** true_colors, int* num_rays) {
-    FILE* csv = fopen(filename, "r");
-    if (!csv) {
-        fprintf(stderr, "Failed to open CSV file: %s\n", filename);
-        return -1;
-    }
-    
-    // Count lines
-    char line[1024];
-    fgets(line, sizeof(line), csv); // Skip header
-    
-    int total_lines = 0;
-    while (fgets(line, sizeof(line), csv)) {
-        total_lines++;
-    }
-    
-    *num_rays = total_lines / NUM_SAMPLES;
-    printf("Found %d rays with %d samples each\n", *num_rays, NUM_SAMPLES);
-    
-    // Allocate memory
-    *X = (float*)malloc(*num_rays * NUM_SAMPLES * 6 * sizeof(float));
-    *true_colors = (float*)malloc(*num_rays * NUM_SAMPLES * 3 * sizeof(float));
-    
-    // Read data
-    rewind(csv);
-    fgets(line, sizeof(line), csv); // Skip header
-    
-    int sample_index = 0;
-    while (fgets(line, sizeof(line), csv) && sample_index < *num_rays * NUM_SAMPLES) {
-        char* token = strtok(line, ",");
-        
-        // Skip first 3 fields (image_filename, ray_id, sample_id)
-        for (int i = 0; i < 3; i++) {
-            token = strtok(NULL, ",");
-        }
-        
-        // Read position and direction (6 values)
-        for (int i = 0; i < 6; i++) {
-            (*X)[sample_index * 6 + i] = atof(token);
-            token = strtok(NULL, ",");
-        }
-        
-        // Read colors (3 values)
-        for (int i = 0; i < 3; i++) {
-            (*true_colors)[sample_index * 3 + i] = atof(token);
-            token = (i < 2) ? strtok(NULL, ",") : strtok(NULL, "\n");
-        }
-        
-        sample_index++;
-    }
-    
-    fclose(csv);
-    return 0;
-}
-
-// Get random batch of rays
-void get_random_batch(float* all_X, float* all_true_colors, int num_rays,
-                     float* batch_X, float* batch_true_colors) {
-    for (int ray = 0; ray < RAYS_PER_BATCH; ray++) {
-        int random_ray = rand() % num_rays;
-        int source_offset = random_ray * NUM_SAMPLES;
-        int dest_offset = ray * NUM_SAMPLES;
-        
-        memcpy(&batch_X[dest_offset * 6], 
-               &all_X[source_offset * 6], 
-               NUM_SAMPLES * 6 * sizeof(float));
-        
-        memcpy(&batch_true_colors[dest_offset * 3], 
-               &all_true_colors[source_offset * 3], 
-               NUM_SAMPLES * 3 * sizeof(float));
-    }
-}
-
 // Process batch and compute loss
 float process_batch(MLP* mlp, float* batch_true_colors) {
     float total_loss = 0.0f;
@@ -245,26 +171,14 @@ void print_sample_predictions(MLP* mlp, float* batch_true_colors) {
 int main() {
     srand(time(NULL));
     openblas_set_num_threads(4);
-    
-    // Find CSV file
-    char csv_filename[256];
-    FILE* ls_pipe = popen("ls -t *.csv | head -1", "r");
-    if (!ls_pipe || !fgets(csv_filename, sizeof(csv_filename), ls_pipe)) {
-        fprintf(stderr, "No CSV file found\n");
+
+    // Load dataset
+    Dataset* dataset = load_dataset("./data/transforms.json", "./data", 100);
+    if (!dataset || dataset->num_images == 0) {
+        fprintf(stderr, "Failed to load dataset\n");
         return -1;
     }
-    csv_filename[strcspn(csv_filename, "\n")] = '\0';
-    pclose(ls_pipe);
-    
-    printf("Using training data: %s\n", csv_filename);
-    
-    // Load training data
-    float *all_X, *all_true_colors;
-    int num_rays;
-    if (load_training_data(csv_filename, &all_X, &all_true_colors, &num_rays) != 0) {
-        return -1;
-    }
-    
+
     // Network setup
     const int input_dim = 6;
     const int hidden_dim = 1024;
@@ -280,22 +194,11 @@ int main() {
     // Training parameters
     const int num_batches = 20000;
     float learning_rate = 0.001f;
-    
-    printf("Starting NeRF training...\n");
-    printf("Architecture: %d -> %d -> %d\n", input_dim, hidden_dim, output_dim);
-    printf("Training rays: %d\n", num_rays);
-    printf("Learning rate: %.6f\n\n", learning_rate);
-    
+
     // Training loop
     for (int batch = 0; batch < num_batches; batch++) {
-        // Learning rate decay
-        if (batch > 0 && batch % 5000 == 0) {
-            learning_rate *= 0.5f;
-            printf("Learning rate reduced to: %.6f\n", learning_rate);
-        }
-        
-        // Get batch and process
-        get_random_batch(all_X, all_true_colors, num_rays, batch_X, batch_true_colors);
+        // Generate batch
+        generate_random_batch(dataset, RAYS_PER_BATCH, batch_X, batch_true_colors);
         
         forward_pass_mlp(mlp, batch_X);
         zero_gradients_mlp(mlp);
@@ -319,14 +222,13 @@ int main() {
     // Save model
     char model_filename[64];
     time_t now = time(NULL);
-    strftime(model_filename, sizeof(model_filename), "%Y%m%d_%H%M%S_nerf_model.bin", localtime(&now));
+    strftime(model_filename, sizeof(model_filename), "%Y%m%d_%H%M%S_model.bin", localtime(&now));
     save_mlp(mlp, model_filename);
     
     printf("\nTraining completed! Model saved to: %s\n", model_filename);
     
     // Cleanup
-    free(all_X);
-    free(all_true_colors);
+    free_dataset(dataset);
     free(batch_X);
     free(batch_true_colors);
     free_mlp(mlp);

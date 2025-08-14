@@ -1,28 +1,4 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <math.h>
-#include <string.h>
-#include <png.h>
-#include <json-c/json.h>
-
-#define NUM_SAMPLES 64
-#define NEAR_PLANE 2.0f
-#define FAR_PLANE 6.0f
-#define PI 3.14159265359f
-
-typedef struct {
-    unsigned char* data;
-    int width;
-    int height;
-    int channels;
-} Image;
-
-typedef struct {
-    float position[3];
-    float rotation[9];
-    float focal;
-    int width, height;
-} Camera;
+#include "data.h"
 
 Image* load_png(const char* filename) {
     FILE* fp = fopen(filename, "rb");
@@ -148,6 +124,74 @@ Camera* load_camera(const char* filename, int frame_idx) {
     return cam;
 }
 
+void free_camera(Camera* cam) {
+    if (cam) {
+        free(cam);
+    }
+}
+
+Dataset* load_dataset(const char* json_path, const char* image_dir, int max_images) {
+    Dataset* dataset = (Dataset*)malloc(sizeof(Dataset));
+    dataset->images = NULL;
+    dataset->cameras = NULL;
+    dataset->num_images = 0;
+    
+    printf("Loading dataset from %s and %s...\n", json_path, image_dir);
+    
+    // Allocate arrays
+    dataset->images = (Image**)malloc(max_images * sizeof(Image*));
+    dataset->cameras = (Camera**)malloc(max_images * sizeof(Camera*));
+    
+    // Load images and cameras
+    for (int i = 0; i < max_images; i++) {
+        // Load image
+        char img_path[512];
+        snprintf(img_path, sizeof(img_path), "%s/r_%d.png", image_dir, i);
+        
+        Image* img = load_png(img_path);
+        if (!img) {
+            printf("Failed to load image %d: %s\n", i, img_path);
+            continue;
+        }
+        
+        // Load camera
+        Camera* cam = load_camera(json_path, i);
+        if (!cam) {
+            printf("Failed to load camera %d\n", i);
+            free_image(img);
+            continue;
+        }
+        
+        // Update camera dimensions to match image
+        cam->width = img->width;
+        cam->height = img->height;
+        cam->focal = cam->width / (2.0f * tanf(0.6911112070083618 / 2.0f)); // Default camera angle from transforms.json
+        
+        dataset->images[dataset->num_images] = img;
+        dataset->cameras[dataset->num_images] = cam;
+        dataset->num_images++;
+        
+        if ((i + 1) % 10 == 0) {
+            printf("Loaded %d/%d images...\n", i + 1, max_images);
+        }
+    }
+    
+    printf("Successfully loaded %d images\n", dataset->num_images);
+    return dataset;
+}
+
+void free_dataset(Dataset* dataset) {
+    if (dataset) {
+        for (int i = 0; i < dataset->num_images; i++) {
+            free_image(dataset->images[i]);
+            free_camera(dataset->cameras[i]);
+        }
+        free(dataset->images);
+        free(dataset->cameras);
+        free(dataset);
+    }
+}
+
 void generate_ray(Camera* cam, int u, int v, float* ray_o, float* ray_d) {
     // Convert pixel coordinates to normalized camera coordinates
     float x = (u - cam->width * 0.5f) / cam->focal;
@@ -169,101 +213,46 @@ void generate_ray(Camera* cam, int u, int v, float* ray_o, float* ray_d) {
     ray_o[2] = cam->position[2];
 }
 
-int main() {
-    const int num_images = 100;
-    const int rays_per_image = 1024;
-    
-    printf("Loading images and generating NeRF training data...\n");
-    
-    // Get timestamp for filename
-    time_t now = time(NULL);
-    char data_fname[64];
-    strftime(data_fname, sizeof(data_fname), "%Y%m%d_%H%M%S_data.csv", localtime(&now));
-    
-    // Open output CSV file
-    FILE* csv = fopen(data_fname, "w");
-    if (!csv) {
-        fprintf(stderr, "Failed to open output CSV file\n");
-        return -1;
+void generate_random_batch(Dataset* dataset, int rays_per_batch, float* batch_X, float* batch_colors) {
+    for (int ray = 0; ray < rays_per_batch; ray++) {
+        // Pick random image
+        int img_idx = rand() % dataset->num_images;
+        Image* img = dataset->images[img_idx];
+        Camera* cam = dataset->cameras[img_idx];
+        
+        // Pick random pixel
+        int u = rand() % cam->width;
+        int v = rand() % cam->height;
+        
+        // Get pixel color (convert from RGBA to RGB and normalize)
+        int pixel_idx = (v * cam->width + u) * 4;  // 4 channels (RGBA)
+        float r_true = img->data[pixel_idx + 0] / 255.0f;
+        float g_true = img->data[pixel_idx + 1] / 255.0f;
+        float b_true = img->data[pixel_idx + 2] / 255.0f;
+        
+        // Generate ray
+        float ray_o[3], ray_d[3];
+        generate_ray(cam, u, v, ray_o, ray_d);
+        
+        // Sample points along the ray
+        for (int sample_idx = 0; sample_idx < NUM_SAMPLES; sample_idx++) {
+            float t = NEAR_PLANE + (FAR_PLANE - NEAR_PLANE) * sample_idx / (NUM_SAMPLES - 1);
+            
+            // 3D position along ray
+            int batch_idx = ray * NUM_SAMPLES + sample_idx;
+            
+            // Input: position + direction (6D)
+            batch_X[batch_idx * 6 + 0] = ray_o[0] + t * ray_d[0];  // x
+            batch_X[batch_idx * 6 + 1] = ray_o[1] + t * ray_d[1];  // y
+            batch_X[batch_idx * 6 + 2] = ray_o[2] + t * ray_d[2];  // z
+            batch_X[batch_idx * 6 + 3] = ray_d[0];                 // dx
+            batch_X[batch_idx * 6 + 4] = ray_d[1];                 // dy
+            batch_X[batch_idx * 6 + 5] = ray_d[2];                 // dz
+            
+            // Ground truth color (same for all samples along this ray)
+            batch_colors[batch_idx * 3 + 0] = r_true;
+            batch_colors[batch_idx * 3 + 1] = g_true;
+            batch_colors[batch_idx * 3 + 2] = b_true;
+        }
     }
-    
-    // Write CSV header
-    fprintf(csv, "image_filename,ray_id,sample_id,x,y,z,dx,dy,dz,r_true,g_true,b_true\n");
-    
-    int global_ray_id = 0;
-    
-    // Process each image
-    for (int img_idx = 0; img_idx < num_images; img_idx++) {
-        printf("Processing image %d/%d...\n", img_idx + 1, num_images);
-        
-        // Load image
-        char img_path[256];
-        snprintf(img_path, sizeof(img_path), "./data/r_%d.png", img_idx);
-        char img_filename[256];
-        snprintf(img_filename, sizeof(img_filename), "r_%d.png", img_idx);
-        
-        Image* img = load_png(img_path);
-        if (!img) {
-            fprintf(stderr, "Failed to load %s\n", img_path);
-            continue;
-        }
-        
-        // Load camera
-        Camera* cam = load_camera("./data/transforms.json", img_idx);
-        if (!cam) {
-            fprintf(stderr, "Failed to load camera %d\n", img_idx);
-            free_image(img);
-            continue;
-        }
-        
-        cam->width = img->width;
-        cam->height = img->height;
-        
-        // Sample random rays from this image
-        for (int ray_idx = 0; ray_idx < rays_per_image; ray_idx++) {
-            // Random pixel coordinates
-            int u = rand() % cam->width;
-            int v = rand() % cam->height;
-            
-            // Get pixel color (convert from RGBA to RGB and normalize)
-            int pixel_idx = (v * cam->width + u) * 4;  // 4 channels (RGBA)
-            float r_true = img->data[pixel_idx + 0] / 255.0f;
-            float g_true = img->data[pixel_idx + 1] / 255.0f;
-            float b_true = img->data[pixel_idx + 2] / 255.0f;
-            
-            // Generate ray
-            float ray_o[3], ray_d[3];
-            generate_ray(cam, u, v, ray_o, ray_d);
-            
-            // Sample points along the ray
-            for (int sample_idx = 0; sample_idx < NUM_SAMPLES; sample_idx++) {
-                float t = NEAR_PLANE + (FAR_PLANE - NEAR_PLANE) * sample_idx / (NUM_SAMPLES - 1);
-                
-                // 3D position along ray
-                float x = ray_o[0] + t * ray_d[0];
-                float y = ray_o[1] + t * ray_d[1];
-                float z = ray_o[2] + t * ray_d[2];
-                
-                // Write to CSV
-                fprintf(csv, "%s,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
-                       img_filename, global_ray_id, sample_idx, x, y, z, 
-                       ray_d[0], ray_d[1], ray_d[2],
-                       r_true, g_true, b_true);
-            }
-            
-            global_ray_id++;
-        }
-        
-        free_image(img);
-        free(cam);
-    }
-    
-    fclose(csv);
-    
-    printf("Generated training data for %d rays with %d samples each\n", 
-           global_ray_id, NUM_SAMPLES);
-    printf("Total data points: %d\n", global_ray_id * NUM_SAMPLES);
-    printf("Data saved to: %s\n", data_fname);
-    
-    return 0;
 }
