@@ -12,165 +12,179 @@
 #define RENDER_WIDTH 128
 #define RENDER_HEIGHT 128
 
-// Activation functions
-static inline float sigmoid(float x) {
-    return 1.0f / (1.0f + expf(-x));
-}
-static inline float sigmoid_derivative(float sigmoid_val) {
-    return sigmoid_val * (1.0f - sigmoid_val);
-}
-static inline float relu(float x) {
-    return fmaxf(0.0f, x);
-}
-static inline float relu_derivative(float x) {
-    return x > 0.0f ? 1.0f : 0.0f;
-}
-
-// Volume rendering: integrate densities and colors along ray
-void render_ray(const float* densities, const float* colors, float* pixel_color) {
-    pixel_color[0] = pixel_color[1] = pixel_color[2] = 0.0f;
-    float transmittance = 1.0f;
-    for (int i = 0; i < NUM_SAMPLES; i++) {
-        float alpha = 1.0f - expf(-densities[i] * 0.01f);
-        float weight = alpha * transmittance;
-        pixel_color[0] += weight * colors[i * 3 + 0];
-        pixel_color[1] += weight * colors[i * 3 + 1];
-        pixel_color[2] += weight * colors[i * 3 + 2];
-        transmittance *= (1.0f - alpha);
-        if (transmittance < 0.01f) break;
-    }
-}
-
-// Compute volume rendering gradients
-void compute_volume_rendering_gradients(const float* densities, const float* colors, const float* pixel_error, float* mlp_error_output) {
-    float alphas[NUM_SAMPLES], transmittance[NUM_SAMPLES], weights[NUM_SAMPLES];
-    for (int s = 0; s < NUM_SAMPLES; s++) alphas[s] = 1.0f - expf(-densities[s] * 0.01f);
-
-    transmittance[0] = 1.0f;
-    weights[0] = alphas[0] * transmittance[0];
-    for (int s = 1; s < NUM_SAMPLES; s++) {
-        transmittance[s] = transmittance[s-1] * (1.0f - alphas[s-1]);
-        weights[s] = alphas[s] * transmittance[s];
-    }
-
-    for (int s = 0; s < NUM_SAMPLES; s++) {
-        // Color gradients with sigmoid derivative
-        for (int c = 0; c < 3; c++) {
-            float sigmoid_val = colors[s * 3 + c];
-            float sigmoid_deriv = sigmoid_derivative(sigmoid_val);
-            mlp_error_output[s * 4 + 1 + c] = weights[s] * pixel_error[c] * sigmoid_deriv;
+// CUDA kernel for activations (output_dim=4: density, rgb)
+__global__ void activation_kernel(float* d_layer2_preact, float* d_layer2_output, int batch_size, int output_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        int base = idx * output_dim;
+        // Density: ReLU
+        d_layer2_output[base + 0] = fmaxf(0.0f, d_layer2_preact[base + 0]);
+        // RGB: Sigmoid
+        for (int c = 1; c < 4; c++) {
+            d_layer2_output[base + c] = 1.0f / (1.0f + expf(-d_layer2_preact[base + c]));
         }
-        // Density gradient with ReLU derivative
-        float dalpha_ddensity = 0.01f * expf(-densities[s] * 0.01f);
-        float density_gradient = dalpha_ddensity * transmittance[s] * (pixel_error[0] * colors[s * 3 + 0] + pixel_error[1] * colors[s * 3 + 1] + pixel_error[2] * colors[s * 3 + 2]);
-        for (int t = s + 1; t < NUM_SAMPLES; t++) {
-            float dtrans_ddensity = -dalpha_ddensity;
-            for (int k = s + 1; k <= t; k++) dtrans_ddensity *= (1.0f - alphas[k-1]);
-            float dweight_t_ddensity = alphas[t] * dtrans_ddensity;
-            density_gradient += dweight_t_ddensity * (pixel_error[0] * colors[t * 3 + 0] + pixel_error[1] * colors[t * 3 + 1] + pixel_error[2] * colors[t * 3 + 2]);
+    }
+}
+
+// CUDA kernel to extract densities and colors per sample
+__global__ void extract_densities_colors_kernel(const float* d_layer2_output, float* d_densities, float* d_colors, int batch_size, int output_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        int base = idx * output_dim;
+        d_densities[idx] = d_layer2_output[base + 0];
+        d_colors[idx * 3 + 0] = d_layer2_output[base + 1];
+        d_colors[idx * 3 + 1] = d_layer2_output[base + 2];
+        d_colors[idx * 3 + 2] = d_layer2_output[base + 3];
+    }
+}
+
+// CUDA kernel for volume rendering and loss computation
+__global__ void volume_rendering_and_loss_kernel(
+    const float* d_densities, const float* d_colors,
+    const float* d_true_colors,
+    float* d_pixel_colors, float* d_pixel_errors, float* d_loss_accum,
+    int rays_per_batch, int num_samples)
+{
+    int ray = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ray < rays_per_batch) {
+        float pixel_color[3] = {0.0f, 0.0f, 0.0f};
+        float transmittance = 1.0f;
+        float weights[NUM_SAMPLES];
+        for (int s = 0; s < num_samples; s++) {
+            float density = d_densities[ray * num_samples + s];
+            float alpha = 1.0f - expf(-density * 0.01f);
+            float weight = alpha * transmittance;
+            weights[s] = weight;
+            for (int c = 0; c < 3; c++)
+                pixel_color[c] += weight * d_colors[(ray * num_samples + s) * 3 + c];
+            transmittance *= (1.0f - alpha);
+            if (transmittance < 0.01f) break;
         }
-        float relu_deriv = relu_derivative(densities[s]);
-        mlp_error_output[s * 4 + 0] = density_gradient * relu_deriv;
-    }
-}
-
-// Apply activations to layer2_output
-void apply_activations_mlp(const MLP* mlp, float* layer2_output) {
-    float* preact = (float*)malloc(mlp->batch_size * mlp->output_dim * sizeof(float));
-    cudaMemcpy(preact, mlp->d_layer2_preact, mlp->batch_size * mlp->output_dim * sizeof(float), cudaMemcpyDeviceToHost);
-    for (int i = 0; i < mlp->batch_size; i++) {
-        int base = i * mlp->output_dim;
-        layer2_output[base + 0] = relu(preact[base + 0]); // Density
-        layer2_output[base + 1] = sigmoid(preact[base + 1]);
-        layer2_output[base + 2] = sigmoid(preact[base + 2]);
-        layer2_output[base + 3] = sigmoid(preact[base + 3]);
-    }
-    free(preact);
-}
-
-// Extract densities and colors for a ray from layer2_output
-void extract_densities_colors(const float* layer2_output, int ray_start_idx, float* densities, float* colors) {
-    for (int s = 0; s < NUM_SAMPLES; s++) {
-        int base = ray_start_idx * 4 + s * 4;
-        densities[s] = layer2_output[base + 0];
-        colors[s * 3 + 0] = layer2_output[base + 1];
-        colors[s * 3 + 1] = layer2_output[base + 2];
-        colors[s * 3 + 2] = layer2_output[base + 3];
-    }
-}
-
-// Process batch and compute loss
-float process_batch(MLP* mlp, const float* layer2_output, const float* batch_true_colors) {
-    float total_loss = 0.0f;
-    for (int ray = 0; ray < RAYS_PER_BATCH; ray++) {
-        int ray_start_idx = ray * NUM_SAMPLES;
-        float* ray_error_output = (float*)malloc(NUM_SAMPLES * 4 * sizeof(float));
-        float densities[NUM_SAMPLES], colors[NUM_SAMPLES * 3];
-        extract_densities_colors(layer2_output, ray_start_idx, densities, colors);
-
-        float predicted_pixel_color[3];
-        render_ray(densities, colors, predicted_pixel_color);
-
-        const float* true_pixel_color = &batch_true_colors[ray_start_idx * 3];
-        float pixel_error[3];
+        // Write predicted color
+        for (int c = 0; c < 3; c++)
+            d_pixel_colors[ray * 3 + c] = pixel_color[c];
+        // Compute error and accumulate loss
         float pixel_loss = 0.0f;
         for (int c = 0; c < 3; c++) {
-            pixel_error[c] = predicted_pixel_color[c] - true_pixel_color[c];
-            pixel_loss += pixel_error[c] * pixel_error[c];
+            float error = pixel_color[c] - d_true_colors[ray * num_samples * 3 + c];
+            d_pixel_errors[ray * 3 + c] = error;
+            pixel_loss += error * error;
         }
-        total_loss += pixel_loss;
-        compute_volume_rendering_gradients(densities, colors, pixel_error, ray_error_output);
-        // Copy ray_error_output to mlp->d_error_output on device (deferred for batch)
-        cudaMemcpy(&mlp->d_error_output[(ray_start_idx) * 4], ray_error_output, NUM_SAMPLES * 4 * sizeof(float), cudaMemcpyHostToDevice);
-        free(ray_error_output);
+        atomicAdd(d_loss_accum, pixel_loss);
     }
-    return total_loss / RAYS_PER_BATCH;
 }
 
-// Render a single pixel
-void render_single_pixel(MLP* temp_mlp, float* ray_X, Camera* cam, int u, int v, float* pixel_color) {
-    float ray_o[3], ray_d[3];
-    generate_ray(cam, u, v, ray_o, ray_d);
-    for (int s = 0; s < NUM_SAMPLES; s++) {
-        float t = NEAR_PLANE + (FAR_PLANE - NEAR_PLANE) * s / (NUM_SAMPLES - 1);
-        ray_X[s * 6 + 0] = ray_o[0] + t * ray_d[0];
-        ray_X[s * 6 + 1] = ray_o[1] + t * ray_d[1];
-        ray_X[s * 6 + 2] = ray_o[2] + t * ray_d[2];
-        ray_X[s * 6 + 3] = ray_d[0];
-        ray_X[s * 6 + 4] = ray_d[1];
-        ray_X[s * 6 + 5] = ray_d[2];
+// CUDA kernel for volume rendering gradient computation (for each ray)
+__global__ void volume_rendering_gradient_kernel(
+    const float* d_densities, const float* d_colors,
+    const float* d_pixel_errors,
+    float* d_mlp_error_output, int rays_per_batch, int num_samples)
+{
+    int ray = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ray < rays_per_batch) {
+        float alphas[NUM_SAMPLES];
+        float transmittance[NUM_SAMPLES];
+        float weights[NUM_SAMPLES];
+        for (int s = 0; s < num_samples; s++) {
+            float density = d_densities[ray * num_samples + s];
+            alphas[s] = 1.0f - expf(-density * 0.01f);
+        }
+        transmittance[0] = 1.0f;
+        weights[0] = alphas[0] * transmittance[0];
+        for (int s = 1; s < num_samples; s++) {
+            transmittance[s] = transmittance[s - 1] * (1.0f - alphas[s - 1]);
+            weights[s] = alphas[s] * transmittance[s];
+        }
+        for (int s = 0; s < num_samples; s++) {
+            // Color gradients (sigmoid derivative)
+            for (int c = 0; c < 3; c++) {
+                float sigmoid_val = d_colors[(ray * num_samples + s) * 3 + c];
+                float sigmoid_deriv = sigmoid_val * (1.0f - sigmoid_val);
+                float grad = weights[s] * d_pixel_errors[ray * 3 + c] * sigmoid_deriv;
+                d_mlp_error_output[(ray * num_samples + s) * 4 + 1 + c] = grad;
+            }
+            // Density gradient (ReLU derivative)
+            float density = d_densities[ray * num_samples + s];
+            float dalpha_ddensity = 0.01f * expf(-density * 0.01f);
+            float density_gradient = dalpha_ddensity * transmittance[s] *
+                (d_pixel_errors[ray * 3 + 0] * d_colors[(ray * num_samples + s) * 3 + 0] +
+                 d_pixel_errors[ray * 3 + 1] * d_colors[(ray * num_samples + s) * 3 + 1] +
+                 d_pixel_errors[ray * 3 + 2] * d_colors[(ray * num_samples + s) * 3 + 2]);
+            for (int t = s + 1; t < num_samples; t++) {
+                float dtrans_ddensity = -dalpha_ddensity;
+                for (int k = s + 1; k <= t; k++)
+                    dtrans_ddensity *= (1.0f - alphas[k - 1]);
+                float dweight_t_ddensity = alphas[t] * dtrans_ddensity;
+                density_gradient += dweight_t_ddensity *
+                    (d_pixel_errors[ray * 3 + 0] * d_colors[(ray * num_samples + t) * 3 + 0] +
+                     d_pixel_errors[ray * 3 + 1] * d_colors[(ray * num_samples + t) * 3 + 1] +
+                     d_pixel_errors[ray * 3 + 2] * d_colors[(ray * num_samples + t) * 3 + 2]);
+            }
+            float relu_deriv = density > 0.0f ? 1.0f : 0.0f;
+            d_mlp_error_output[(ray * num_samples + s) * 4 + 0] = density_gradient * relu_deriv;
+        }
     }
-    float* d_ray_X;
-    cudaMalloc(&d_ray_X, NUM_SAMPLES * 6 * sizeof(float));
-    cudaMemcpy(d_ray_X, ray_X, NUM_SAMPLES * 6 * sizeof(float), cudaMemcpyHostToDevice);
-    forward_pass_mlp(temp_mlp, d_ray_X);
-    float* layer2_output = (float*)malloc(NUM_SAMPLES * 4 * sizeof(float));
-    apply_activations_mlp(temp_mlp, layer2_output);
-    float densities[NUM_SAMPLES], colors[NUM_SAMPLES * 3];
-    extract_densities_colors(layer2_output, 0, densities, colors);
-    render_ray(densities, colors, pixel_color);
-    free(layer2_output);
-    cudaFree(d_ray_X);
 }
 
-// Render a test image
+// Full implementation of render_test_image
 void render_test_image(MLP* mlp, Dataset* dataset, int batch_num, cublasHandle_t cublas_handle) {
     printf("  Rendering test image %dx%d...\n", RENDER_WIDTH, RENDER_HEIGHT);
     Camera* cam = dataset->cameras[0];
     MLP* temp_mlp = init_mlp(mlp->input_dim, mlp->hidden_dim, mlp->output_dim, NUM_SAMPLES, cublas_handle);
-    // Copy weights from trained model
     cudaMemcpy(temp_mlp->d_W1, mlp->d_W1, mlp->hidden_dim * mlp->input_dim * sizeof(float), cudaMemcpyDeviceToDevice);
     cudaMemcpy(temp_mlp->d_W2, mlp->d_W2, mlp->output_dim * mlp->hidden_dim * sizeof(float), cudaMemcpyDeviceToDevice);
     cudaMemcpy(temp_mlp->d_W3, mlp->d_W3, mlp->output_dim * mlp->input_dim * sizeof(float), cudaMemcpyDeviceToDevice);
     float* ray_X = (float*)malloc(NUM_SAMPLES * 6 * sizeof(float));
     unsigned char* image_data = (unsigned char*)malloc(RENDER_WIDTH * RENDER_HEIGHT * 3);
 
+    // Buffers for CUDA pipeline
+    float* d_ray_X;
+    float* d_layer2_output;
+    float* d_densities;
+    float* d_colors;
+    cudaMalloc(&d_ray_X, NUM_SAMPLES * 6 * sizeof(float));
+    cudaMalloc(&d_layer2_output, NUM_SAMPLES * 4 * sizeof(float));
+    cudaMalloc(&d_densities, NUM_SAMPLES * sizeof(float));
+    cudaMalloc(&d_colors, NUM_SAMPLES * 3 * sizeof(float));
+
     for (int v = 0; v < RENDER_HEIGHT; v++) {
         for (int u = 0; u < RENDER_WIDTH; u++) {
             int scaled_u = (int)(u * (float)cam->width / RENDER_WIDTH);
             int scaled_v = (int)(v * (float)cam->height / RENDER_HEIGHT);
-            float pixel_color[3];
-            render_single_pixel(temp_mlp, ray_X, cam, scaled_u, scaled_v, pixel_color);
+            float ray_o[3], ray_d[3];
+            generate_ray(cam, scaled_u, scaled_v, ray_o, ray_d);
+            for (int s = 0; s < NUM_SAMPLES; s++) {
+                float t = NEAR_PLANE + (FAR_PLANE - NEAR_PLANE) * s / (NUM_SAMPLES - 1);
+                ray_X[s * 6 + 0] = ray_o[0] + t * ray_d[0];
+                ray_X[s * 6 + 1] = ray_o[1] + t * ray_d[1];
+                ray_X[s * 6 + 2] = ray_o[2] + t * ray_d[2];
+                ray_X[s * 6 + 3] = ray_d[0];
+                ray_X[s * 6 + 4] = ray_d[1];
+                ray_X[s * 6 + 5] = ray_d[2];
+            }
+            cudaMemcpy(d_ray_X, ray_X, NUM_SAMPLES * 6 * sizeof(float), cudaMemcpyHostToDevice);
+            forward_pass_mlp(temp_mlp, d_ray_X);
+
+            int block_size = 64;
+            int num_blocks = (NUM_SAMPLES + block_size - 1) / block_size;
+            activation_kernel<<<num_blocks, block_size>>>(temp_mlp->d_layer2_preact, d_layer2_output, NUM_SAMPLES, temp_mlp->output_dim);
+            extract_densities_colors_kernel<<<num_blocks, block_size>>>(d_layer2_output, d_densities, d_colors, NUM_SAMPLES, temp_mlp->output_dim);
+
+            // Copy to host for rendering
+            float densities[NUM_SAMPLES], colors[NUM_SAMPLES * 3];
+            cudaMemcpy(densities, d_densities, NUM_SAMPLES * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(colors, d_colors, NUM_SAMPLES * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+
+            float pixel_color[3] = {0,0,0};
+            float transmittance = 1.0f;
+            for (int s = 0; s < NUM_SAMPLES; s++) {
+                float alpha = 1.0f - expf(-densities[s] * 0.01f);
+                float weight = alpha * transmittance;
+                for (int c = 0; c < 3; c++)
+                    pixel_color[c] += weight * colors[s * 3 + c];
+                transmittance *= (1.0f - alpha);
+                if (transmittance < 0.01f) break;
+            }
             int pixel_idx = (v * RENDER_WIDTH + u) * 3;
             for (int c = 0; c < 3; c++)
                 image_data[pixel_idx + c] = (unsigned char)(fminf(1.0f, fmaxf(0.0f, pixel_color[c])) * 255);
@@ -182,9 +196,14 @@ void render_test_image(MLP* mlp, Dataset* dataset, int batch_num, cublasHandle_t
     snprintf(png_filename, sizeof(png_filename), "%06d_sample.png", batch_num);
     save_png(png_filename, image_data, RENDER_WIDTH, RENDER_HEIGHT);
     printf("  Test image saved as %s\n\n", png_filename);
+
     free(image_data);
     free(ray_X);
     free_mlp(temp_mlp);
+    cudaFree(d_ray_X);
+    cudaFree(d_layer2_output);
+    cudaFree(d_densities);
+    cudaFree(d_colors);
 }
 
 int main() {
@@ -203,11 +222,29 @@ int main() {
 
     MLP* mlp = init_mlp(input_dim, hidden_dim, output_dim, batch_size, cublas_handle);
 
+    // Allocate host and device memory for batch
     float* batch_X = (float*)malloc(batch_size * input_dim * sizeof(float));
     float* batch_true_colors = (float*)malloc(batch_size * 3 * sizeof(float));
     float* d_batch_X;
-    float* layer2_output = (float*)malloc(batch_size * output_dim * sizeof(float));
+    float* d_batch_true_colors;
     cudaMalloc(&d_batch_X, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_batch_true_colors, batch_size * 3 * sizeof(float));
+
+    // Device memory for activations, densities, colors, predicted pixel colors, pixel errors, loss
+    float* d_layer2_output;
+    float* d_densities;
+    float* d_colors;
+    float* d_pixel_colors;
+    float* d_pixel_errors;
+    float* d_loss_accum;
+    cudaMalloc(&d_layer2_output, batch_size * output_dim * sizeof(float));
+    cudaMalloc(&d_densities, batch_size * sizeof(float));
+    cudaMalloc(&d_colors, batch_size * 3 * sizeof(float));
+    cudaMalloc(&d_pixel_colors, RAYS_PER_BATCH * 3 * sizeof(float));
+    cudaMalloc(&d_pixel_errors, RAYS_PER_BATCH * 3 * sizeof(float));
+    cudaMalloc(&d_loss_accum, sizeof(float));
+
+    float* d_mlp_error_output = mlp->d_error_output; // Use directly
 
     const int num_batches = 20000;
     float learning_rate = 0.001f;
@@ -215,19 +252,50 @@ int main() {
     for (int batch = 0; batch < num_batches; batch++) {
         generate_random_batch(dataset, RAYS_PER_BATCH, batch_X, batch_true_colors);
         cudaMemcpy(d_batch_X, batch_X, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_batch_true_colors, batch_true_colors, batch_size * 3 * sizeof(float), cudaMemcpyHostToDevice);
+
+        // Forward pass
         forward_pass_mlp(mlp, d_batch_X);
-        apply_activations_mlp(mlp, layer2_output);
+
+        // Activation (on GPU)
+        int block_size = 256;
+        int num_blocks = (batch_size + block_size - 1) / block_size;
+        activation_kernel<<<num_blocks, block_size>>>(mlp->d_layer2_preact, d_layer2_output, batch_size, output_dim);
+
+        // Extract densities/colors
+        extract_densities_colors_kernel<<<num_blocks, block_size>>>(d_layer2_output, d_densities, d_colors, batch_size, output_dim);
+
+        // Zero gradients
         zero_gradients_mlp(mlp);
 
-        float loss = process_batch(mlp, layer2_output, batch_true_colors);
+        // Volume rendering and loss computation (per ray)
+        cudaMemset(d_loss_accum, 0, sizeof(float));
+        int ray_block_size = 64;
+        int ray_num_blocks = (RAYS_PER_BATCH + ray_block_size - 1) / ray_block_size;
+        volume_rendering_and_loss_kernel<<<ray_num_blocks, ray_block_size>>>(
+            d_densities, d_colors, d_batch_true_colors,
+            d_pixel_colors, d_pixel_errors, d_loss_accum, RAYS_PER_BATCH, NUM_SAMPLES);
+
+        // Volume rendering gradient computation (per ray)
+        volume_rendering_gradient_kernel<<<ray_num_blocks, ray_block_size>>>(
+            d_densities, d_colors, d_pixel_errors,
+            d_mlp_error_output, RAYS_PER_BATCH, NUM_SAMPLES);
+
+        // Backward pass
         backward_pass_mlp(mlp, d_batch_X);
         update_weights_mlp(mlp, learning_rate);
 
+        // Copy loss to host and print
+        float total_loss = 0.0f;
+        cudaMemcpy(&total_loss, d_loss_accum, sizeof(float), cudaMemcpyDeviceToHost);
+        total_loss /= RAYS_PER_BATCH;
+
         if ((batch + 1) % 100 == 0) {
-            printf("Batch [%d/%d], Loss: %.6f\n", batch + 1, num_batches, loss);
+            printf("Batch [%d/%d], Loss: %.6f\n", batch + 1, num_batches, total_loss);
             if ((batch + 1) % 5000 == 0) render_test_image(mlp, dataset, batch + 1, cublas_handle);
         }
     }
+
     char model_filename[64];
     time_t now = time(NULL);
     strftime(model_filename, sizeof(model_filename), "%Y%m%d_%H%M%S_model.bin", localtime(&now));
@@ -238,9 +306,15 @@ int main() {
     free_dataset(dataset);
     free(batch_X);
     free(batch_true_colors);
-    free(layer2_output);
     free_mlp(mlp);
     cudaFree(d_batch_X);
+    cudaFree(d_batch_true_colors);
+    cudaFree(d_layer2_output);
+    cudaFree(d_densities);
+    cudaFree(d_colors);
+    cudaFree(d_pixel_colors);
+    cudaFree(d_pixel_errors);
+    cudaFree(d_loss_accum);
     cublasDestroy(cublas_handle);
 
     return 0;
