@@ -52,6 +52,53 @@ Image* load_png(const char* filename) {
     return img;
 }
 
+// Save PNG image
+void save_png(const char* filename, unsigned char* image_data, int width, int height) {
+    FILE* fp = fopen(filename, "wb");
+    if (!fp) {
+        printf("  Error: Could not create %s\n", filename);
+        return;
+    }
+    
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png) {
+        fclose(fp);
+        return;
+    }
+    
+    png_infop info = png_create_info_struct(png);
+    if (!info) {
+        png_destroy_write_struct(&png, NULL);
+        fclose(fp);
+        return;
+    }
+    
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_write_struct(&png, &info);
+        fclose(fp);
+        return;
+    }
+    
+    png_init_io(png, fp);
+    
+    png_set_IHDR(png, info, width, height, 8, PNG_COLOR_TYPE_RGB,
+                PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_BASE, PNG_FILTER_TYPE_BASE);
+    
+    png_write_info(png, info);
+    
+    png_bytep* row_pointers = (png_bytep*)malloc(sizeof(png_bytep) * height);
+    for (int y = 0; y < height; y++) {
+        row_pointers[y] = &image_data[y * width * 3];
+    }
+    
+    png_write_image(png, row_pointers);
+    png_write_end(png, info);
+    
+    free(row_pointers);
+    png_destroy_write_struct(&png, &info);
+    fclose(fp);
+}
+
 void free_image(Image* img) {
     if (img) {
         if (img->data) free(img->data);

@@ -36,6 +36,7 @@ typedef struct {
 
 // Function prototypes
 Image* load_png(const char* filename);
+void save_png(const char* filename, unsigned char* image_data, int width, int height);
 void free_image(Image* img);
 Camera* load_camera(const char* filename, int frame_idx);
 void free_camera(Camera* cam);
