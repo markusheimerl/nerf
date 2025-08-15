@@ -9,7 +9,7 @@
 #include "data.h"
 #include "mlp/gpu/mlp.h"
 
-int main() {
+int main(int argc, char* argv[]) {
     srand(time(NULL));
     
     // Configuration parameters
@@ -86,7 +86,16 @@ int main() {
     CHECK_CUBLAS(cublasSetMathMode(cublas_handle, CUBLAS_TENSOR_OP_MATH));
     
     // Initialize neural network
-    MLP* mlp = init_mlp(input_dim, hidden_dim, output_dim, num_layers, batch_size, cublas_handle);
+    MLP* mlp;
+    if (argc > 1) {
+        // Continue training from existing model
+        printf("Loading existing model: %s\n", argv[1]);
+        mlp = load_mlp(argv[1], batch_size, cublas_handle);
+    } else {
+        // Initialize new model
+        printf("Starting new training\n");
+        mlp = init_mlp(input_dim, hidden_dim, output_dim, num_layers, batch_size, cublas_handle);
+    }
     
     // Allocate host memory
     float* batch_X = (float*)malloc(batch_size * raw_input_dim * sizeof(float));
@@ -122,7 +131,8 @@ int main() {
     printf("Positional encoding: pos_L=%d, dir_L=%d, total_dim=%d\n", pos_enc_l, dir_enc_l, pe_input_dim);
     
     // Training loop
-    for (int batch = 0; batch < num_batches; batch++) {
+    int starting_batch = mlp->t;
+    for (int batch = starting_batch; batch < starting_batch + num_batches; batch++) {
         // Learning rate decay
         if (batch % 10000 == 0) {
             learning_rate *= 0.99f;
@@ -177,7 +187,7 @@ int main() {
             total_loss /= rays_per_batch;
             
             printf("Batch [%d/%d], Loss: %.6f, LR: %.6f\n", 
-                   batch + 1, num_batches, total_loss, learning_rate);
+                   batch + 1, starting_batch + num_batches, total_loss, learning_rate);
             
             if ((batch + 1) % 5000 == 0) {
                 render_test_image(mlp, dataset, batch + 1, cublas_handle,

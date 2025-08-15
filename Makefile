@@ -18,11 +18,14 @@ nerf.o: nerf.c nerf.h data.h mlp/gpu/mlp.h
 data.o: data.c data.h
 	$(CC) $(CFLAGS) $(CUDAFLAGS) -c data.c -o data.o
 
-mlp/gpu/mlp.o: mlp/gpu/mlp.c mlp/gpu/mlp.h
-	$(CC) $(CFLAGS) $(CUDAFLAGS) -c mlp/gpu/mlp.c -o mlp/gpu/mlp.o
+mlp/gpu/mlp.o:
+	$(MAKE) -C mlp/gpu mlp.o ARCH=$(ARCH)
 
 run: train.out
 	@time ./train.out
+
+cont: train.out
+	@time ./train.out $(shell ls -t *_nerf_model.bin 2>/dev/null | head -1)
 
 clean:
 	rm -f *.out *.o *_sample.png
