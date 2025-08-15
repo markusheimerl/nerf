@@ -13,8 +13,8 @@ int main() {
     srand(time(NULL));
     
     // Configuration parameters
-    const int rays_per_batch = 8;
-    const int num_samples = 64;
+    const int rays_per_batch = 16;
+    const int num_samples = 128;
     const float near_plane = 2.0f;
     const float far_plane = 6.0f;
     const int pos_enc_l = 16;
@@ -114,7 +114,7 @@ int main() {
     
     // Training parameters
     const int num_batches = 2000000;
-    float learning_rate = 0.0003f;
+    float learning_rate = 0.0001f;
     
     printf("Starting NeRF training with %d batches...\n", num_batches);
     printf("Batch size: %d rays, %d samples per ray\n", rays_per_batch, num_samples);
@@ -125,7 +125,7 @@ int main() {
     for (int batch = 0; batch < num_batches; batch++) {
         // Learning rate decay
         if (batch % 10000 == 0) {
-            learning_rate *= 0.999f;
+            learning_rate *= 0.99f;
         }
         
         // Generate training batch
