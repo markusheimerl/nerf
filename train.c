@@ -17,8 +17,8 @@ int main() {
     const int num_samples = 64;
     const float near_plane = 2.0f;
     const float far_plane = 6.0f;
-    const int pos_enc_l = 8;
-    const int dir_enc_l = 4;
+    const int pos_enc_l = 16;
+    const int dir_enc_l = 8;
     const int input_pos_dim = 3;
     const int input_dir_dim = 3;
     const int render_width = 128;
@@ -41,7 +41,7 @@ int main() {
     const int input_dim = pe_input_dim;
     const int hidden_dim = 512;
     const int output_dim = 4;  // density + RGB
-    const int num_layers = 1;
+    const int num_layers = 2;
     const int batch_size = rays_per_batch * num_samples;
     
     // Initialize CUDA and cuBLAS
@@ -114,7 +114,7 @@ int main() {
     
     // Training parameters
     const int num_batches = 2000000;
-    float learning_rate = 0.001f;
+    float learning_rate = 0.0003f;
     
     printf("Starting NeRF training with %d batches...\n", num_batches);
     printf("Batch size: %d rays, %d samples per ray\n", rays_per_batch, num_samples);
