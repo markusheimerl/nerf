@@ -46,6 +46,47 @@ int main() {
     
     // Initialize CUDA and cuBLAS
     CHECK_CUDA(cudaSetDevice(0));
+    
+    // Query GPU properties and calculate optimal block size ONCE
+    cudaDeviceProp prop;
+    CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
+    printf("GPU: %s\n", prop.name);
+    printf("Max shared memory per block: %zu bytes (%.1f KB)\n", 
+           prop.sharedMemPerBlock, prop.sharedMemPerBlock / 1024.0f);
+    printf("Max threads per block: %d\n", prop.maxThreadsPerBlock);
+    
+    // Calculate optimal block size based on shared memory constraints
+    int max_shared_mem = prop.sharedMemPerBlock;
+    int required_shared_mem_per_thread = num_samples * 3 * sizeof(float);
+    int max_threads_by_shared_mem = max_shared_mem / required_shared_mem_per_thread;
+    
+    // Start with a reasonable block size and adjust down if needed
+    int ray_block_size = 64;
+    if (ray_block_size > max_threads_by_shared_mem) {
+        ray_block_size = max_threads_by_shared_mem;
+        // Round down to nearest multiple of 32 (warp size) for efficiency
+        ray_block_size = (ray_block_size / 32) * 32;
+        // Ensure minimum block size of 32
+        ray_block_size = fmaxf(32, ray_block_size);
+    }
+    
+    // Also respect GPU's maximum threads per block limit
+    ray_block_size = fminf(ray_block_size, prop.maxThreadsPerBlock);
+    
+    int ray_num_blocks = (rays_per_batch + ray_block_size - 1) / ray_block_size;
+    int shared_mem_size = ray_block_size * num_samples * 3 * sizeof(float);
+    
+    // Print calculated configuration
+    printf("\nOptimal kernel configuration:\n");
+    printf("  Required shared mem per thread: %d bytes\n", required_shared_mem_per_thread);
+    printf("  Max threads by shared mem: %d\n", max_threads_by_shared_mem);
+    printf("  Chosen ray block size: %d\n", ray_block_size);
+    printf("  Number of blocks: %d\n", ray_num_blocks);
+    printf("  Total shared mem usage: %d bytes (%.1f KB)\n", 
+           shared_mem_size, shared_mem_size / 1024.0f);
+    printf("  Shared mem utilization: %.1f%%\n\n", 
+           100.0f * shared_mem_size / max_shared_mem);
+    
     cublasHandle_t cublas_handle;
     CHECK_CUBLAS(cublasCreate(&cublas_handle));
     CHECK_CUBLAS(cublasSetMathMode(cublas_handle, CUBLAS_TENSOR_OP_MATH));
@@ -120,9 +161,6 @@ int main() {
         
         // Volume rendering and loss computation
         CHECK_CUDA(cudaMemset(d_loss_accum, 0, sizeof(float)));
-        int ray_block_size = 64;
-        int ray_num_blocks = (rays_per_batch + ray_block_size - 1) / ray_block_size;
-        int shared_mem_size = ray_block_size * num_samples * 3 * sizeof(float);
         
         volume_rendering_and_loss_kernel<<<ray_num_blocks, ray_block_size>>>(
             d_densities, d_colors, d_batch_true_colors,

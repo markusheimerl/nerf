@@ -291,7 +291,8 @@ void render_test_image(void* mlp_ptr, const Dataset* dataset, int batch_num, voi
                 temp_mlp->d_layer_output[last_layer], d_densities, d_colors, num_samples, temp_mlp->output_dim);
 
             // Copy results back to host
-            float densities[num_samples], colors[num_samples * 3];
+            float* densities = (float*)malloc(num_samples * sizeof(float));
+            float* colors = (float*)malloc(num_samples * 3 * sizeof(float));
             cudaMemcpy(densities, d_densities, num_samples * sizeof(float), cudaMemcpyDeviceToHost);
             cudaMemcpy(colors, d_colors, num_samples * 3 * sizeof(float), cudaMemcpyDeviceToHost);
 
@@ -314,6 +315,9 @@ void render_test_image(void* mlp_ptr, const Dataset* dataset, int batch_num, voi
                 image_data[pixel_idx + c] = (unsigned char)(
                     fminf(1.0f, fmaxf(0.0f, pixel_color[c])) * 255);
             }
+            
+            free(densities);
+            free(colors);
         }
         
         // Progress indicator
