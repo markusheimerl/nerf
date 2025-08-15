@@ -59,16 +59,10 @@ int main() {
     int max_shared_mem = prop.sharedMemPerBlock;
     int required_shared_mem_per_thread = num_samples * 3 * sizeof(float);
     int max_threads_by_shared_mem = max_shared_mem / required_shared_mem_per_thread;
-    
-    // Start with a reasonable block size and adjust down if needed
-    int ray_block_size = 64;
-    if (ray_block_size > max_threads_by_shared_mem) {
-        ray_block_size = max_threads_by_shared_mem;
-        // Round down to nearest multiple of 32 (warp size) for efficiency
-        ray_block_size = (ray_block_size / 32) * 32;
-        // Ensure minimum block size of 32
-        ray_block_size = fmaxf(32, ray_block_size);
-    }
+    int ray_block_size = max_threads_by_shared_mem;
+    ray_block_size = (ray_block_size / 32) * 32;
+    if (ray_block_size < 32) ray_block_size = max_threads_by_shared_mem;
+    ray_block_size = fmaxf(1, ray_block_size);
     
     // Also respect GPU's maximum threads per block limit
     ray_block_size = fminf(ray_block_size, prop.maxThreadsPerBlock);
