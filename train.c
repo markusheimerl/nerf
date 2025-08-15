@@ -203,10 +203,10 @@ void render_test_image(MLP* mlp, Dataset* dataset, int batch_num, cublasHandle_t
     Camera novel_cam;
     generate_interpolated_camera(dataset, &novel_cam);
 
-    MLP* temp_mlp = init_mlp(mlp->input_dim, mlp->hidden_dim, mlp->output_dim, NUM_SAMPLES, cublas_handle);
-    cudaMemcpy(temp_mlp->d_W1, mlp->d_W1, mlp->hidden_dim * mlp->input_dim * sizeof(float), cudaMemcpyDeviceToDevice);
-    cudaMemcpy(temp_mlp->d_W2, mlp->d_W2, mlp->output_dim * mlp->hidden_dim * sizeof(float), cudaMemcpyDeviceToDevice);
-    cudaMemcpy(temp_mlp->d_W3, mlp->d_W3, mlp->output_dim * mlp->input_dim * sizeof(float), cudaMemcpyDeviceToDevice);
+    MLP* temp_mlp = init_mlp(mlp->input_dim, mlp->hidden_dim, mlp->output_dim, 1, NUM_SAMPLES, cublas_handle);
+    cudaMemcpy(temp_mlp->d_W1[0], mlp->d_W1[0], mlp->hidden_dim * mlp->input_dim * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(temp_mlp->d_W2[0], mlp->d_W2[0], mlp->output_dim * mlp->hidden_dim * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(temp_mlp->d_W3[0], mlp->d_W3[0], mlp->output_dim * mlp->input_dim * sizeof(float), cudaMemcpyDeviceToDevice);
 
     float* ray_X = (float*)malloc(NUM_SAMPLES * RAW_INPUT_DIM * sizeof(float));
     float* ray_PE_X = (float*)malloc(NUM_SAMPLES * PE_INPUT_DIM * sizeof(float));
@@ -243,7 +243,7 @@ void render_test_image(MLP* mlp, Dataset* dataset, int batch_num, cublasHandle_t
 
             int block_size = 64;
             int num_blocks = (NUM_SAMPLES + block_size - 1) / block_size;
-            activation_kernel<<<num_blocks, block_size>>>(temp_mlp->d_layer2_preact, d_layer2_output, NUM_SAMPLES, temp_mlp->output_dim);
+            activation_kernel<<<num_blocks, block_size>>>(temp_mlp->d_layer_output[0], d_layer2_output, NUM_SAMPLES, temp_mlp->output_dim);
             extract_densities_colors_kernel<<<num_blocks, block_size>>>(d_layer2_output, d_densities, d_colors, NUM_SAMPLES, temp_mlp->output_dim);
 
             float densities[NUM_SAMPLES], colors[NUM_SAMPLES * 3];
@@ -295,7 +295,7 @@ int main() {
     cublasCreate(&cublas_handle);
     cublasSetMathMode(cublas_handle, CUBLAS_TENSOR_OP_MATH);
 
-    MLP* mlp = init_mlp(input_dim, hidden_dim, output_dim, batch_size, cublas_handle);
+    MLP* mlp = init_mlp(input_dim, hidden_dim, output_dim, 1, batch_size, cublas_handle);
 
     float* batch_X = (float*)malloc(batch_size * RAW_INPUT_DIM * sizeof(float));
     float* batch_PE_X = (float*)malloc(batch_size * PE_INPUT_DIM * sizeof(float));
@@ -318,7 +318,7 @@ int main() {
     cudaMalloc(&d_pixel_errors, RAYS_PER_BATCH * 3 * sizeof(float));
     cudaMalloc(&d_loss_accum, sizeof(float));
 
-    float* d_mlp_error_output = mlp->d_error_output;
+    float* d_mlp_error_output = mlp->d_error_output[0];
 
     const int num_batches = 2000000;
     float learning_rate = 0.001f;
@@ -334,7 +334,7 @@ int main() {
 
         int block_size = 256;
         int num_blocks = (batch_size + block_size - 1) / block_size;
-        activation_kernel<<<num_blocks, block_size>>>(mlp->d_layer2_preact, d_layer2_output, batch_size, output_dim);
+        activation_kernel<<<num_blocks, block_size>>>(mlp->d_layer_output[0], d_layer2_output, batch_size, output_dim);
 
         extract_densities_colors_kernel<<<num_blocks, block_size>>>(d_layer2_output, d_densities, d_colors, batch_size, output_dim);
 
