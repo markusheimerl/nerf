@@ -8,7 +8,11 @@ Image* load_png(const char* filename) {
     if (!png) { fclose(fp); return NULL; }
     
     png_infop info = png_create_info_struct(png);
-    if (!info) { png_destroy_read_struct(&png, NULL, NULL); fclose(fp); return NULL; }
+    if (!info) { 
+        png_destroy_read_struct(&png, NULL, NULL); 
+        fclose(fp); 
+        return NULL; 
+    }
     
     if (setjmp(png_jmpbuf(png))) {
         png_destroy_read_struct(&png, &info, NULL);
@@ -25,6 +29,7 @@ Image* load_png(const char* filename) {
     png_byte color_type = png_get_color_type(png, info);
     png_byte bit_depth = png_get_bit_depth(png, info);
     
+    // Normalize to 8-bit RGBA
     if (bit_depth == 16) png_set_strip_16(png);
     if (color_type == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
     if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) png_set_expand_gray_1_2_4_to_8(png);
@@ -35,7 +40,7 @@ Image* load_png(const char* filename) {
         png_set_gray_to_rgb(png);
     
     png_read_update_info(png, info);
-    img->channels = 4;
+    img->channels = 4; // Always RGBA after processing
     img->data = (unsigned char*)malloc(img->height * png_get_rowbytes(png, info));
     
     png_bytep* row_pointers = (png_bytep*)malloc(sizeof(png_bytep) * img->height);
@@ -52,19 +57,15 @@ Image* load_png(const char* filename) {
     return img;
 }
 
-// Save PNG image
 void save_png(const char* filename, unsigned char* image_data, int width, int height) {
     FILE* fp = fopen(filename, "wb");
     if (!fp) {
-        printf("  Error: Could not create %s\n", filename);
+        printf("Error: Could not create %s\n", filename);
         return;
     }
     
     png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-    if (!png) {
-        fclose(fp);
-        return;
-    }
+    if (!png) { fclose(fp); return; }
     
     png_infop info = png_create_info_struct(png);
     if (!info) {
@@ -80,10 +81,8 @@ void save_png(const char* filename, unsigned char* image_data, int width, int he
     }
     
     png_init_io(png, fp);
-    
     png_set_IHDR(png, info, width, height, 8, PNG_COLOR_TYPE_RGB,
                 PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_BASE, PNG_FILTER_TYPE_BASE);
-    
     png_write_info(png, info);
     
     png_bytep* row_pointers = (png_bytep*)malloc(sizeof(png_bytep) * height);
@@ -101,13 +100,13 @@ void save_png(const char* filename, unsigned char* image_data, int width, int he
 
 void free_image(Image* img) {
     if (img) {
-        if (img->data) free(img->data);
+        free(img->data);
         free(img);
     }
 }
 
-Camera* load_camera(const char* filename, int frame_idx) {
-    FILE* fp = fopen(filename, "r");
+Camera* load_camera(const char* json_path, int frame_idx) {
+    FILE* fp = fopen(json_path, "r");
     if (!fp) return NULL;
     
     fseek(fp, 0, SEEK_END);
@@ -148,6 +147,7 @@ Camera* load_camera(const char* filename, int frame_idx) {
     
     Camera* cam = (Camera*)malloc(sizeof(Camera));
     
+    // Parse 4x4 transformation matrix
     for (int i = 0; i < 4; i++) {
         json_object* row = json_object_array_get_idx(transform_matrix_obj, i);
         for (int j = 0; j < 4; j++) {
@@ -162,6 +162,7 @@ Camera* load_camera(const char* filename, int frame_idx) {
         }
     }
     
+    // Set default dimensions and focal length
     cam->width = 400;
     cam->height = 400;
     cam->focal = cam->width / (2.0f * tanf(camera_angle_x / 2.0f));
@@ -172,26 +173,55 @@ Camera* load_camera(const char* filename, int frame_idx) {
 }
 
 void free_camera(Camera* cam) {
-    if (cam) {
-        free(cam);
+    free(cam);
+}
+
+void interpolate_cameras(const Camera* cam_a, const Camera* cam_b, float alpha, Camera* out_cam) {
+    // Linear interpolation of position
+    for (int i = 0; i < 3; i++) {
+        out_cam->position[i] = (1.0f - alpha) * cam_a->position[i] + alpha * cam_b->position[i];
     }
+    
+    // Linear interpolation of rotation matrix followed by re-orthogonalization
+    for (int i = 0; i < 9; i++) {
+        out_cam->rotation[i] = (1.0f - alpha) * cam_a->rotation[i] + alpha * cam_b->rotation[i];
+    }
+    
+    // Re-orthogonalize rotation matrix using Gram-Schmidt
+    float* r = &out_cam->rotation[0]; // right vector (column 0)
+    float* u = &out_cam->rotation[3]; // up vector (column 1)  
+    float* f = &out_cam->rotation[6]; // forward vector (column 2)
+    
+    // Normalize forward vector
+    float f_norm = sqrtf(f[0]*f[0] + f[1]*f[1] + f[2]*f[2]);
+    for (int i = 0; i < 3; i++) f[i] /= f_norm;
+    
+    // Orthogonalize up vector
+    float dot_uf = u[0]*f[0] + u[1]*f[1] + u[2]*f[2];
+    for (int i = 0; i < 3; i++) u[i] -= dot_uf * f[i];
+    float u_norm = sqrtf(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]);
+    for (int i = 0; i < 3; i++) u[i] /= u_norm;
+    
+    // Compute right as cross product of up and forward
+    r[0] = u[1]*f[2] - u[2]*f[1];
+    r[1] = u[2]*f[0] - u[0]*f[2];
+    r[2] = u[0]*f[1] - u[1]*f[0];
+    
+    // Interpolate focal length
+    out_cam->focal = (1.0f - alpha) * cam_a->focal + alpha * cam_b->focal;
+    out_cam->width = cam_a->width;
+    out_cam->height = cam_a->height;
 }
 
 Dataset* load_dataset(const char* json_path, const char* image_dir, int max_images) {
     Dataset* dataset = (Dataset*)malloc(sizeof(Dataset));
-    dataset->images = NULL;
-    dataset->cameras = NULL;
+    dataset->images = (Image**)malloc(max_images * sizeof(Image*));
+    dataset->cameras = (Camera**)malloc(max_images * sizeof(Camera*));
     dataset->num_images = 0;
     
     printf("Loading dataset from %s and %s...\n", json_path, image_dir);
     
-    // Allocate arrays
-    dataset->images = (Image**)malloc(max_images * sizeof(Image*));
-    dataset->cameras = (Camera**)malloc(max_images * sizeof(Camera*));
-    
-    // Load images and cameras
     for (int i = 0; i < max_images; i++) {
-        // Load image
         char img_path[512];
         snprintf(img_path, sizeof(img_path), "%s/r_%d.png", image_dir, i);
         
@@ -201,7 +231,6 @@ Dataset* load_dataset(const char* json_path, const char* image_dir, int max_imag
             continue;
         }
         
-        // Load camera
         Camera* cam = load_camera(json_path, i);
         if (!cam) {
             printf("Failed to load camera %d\n", i);
@@ -209,10 +238,10 @@ Dataset* load_dataset(const char* json_path, const char* image_dir, int max_imag
             continue;
         }
         
-        // Update camera dimensions to match image
+        // Update camera dimensions to match loaded image
         cam->width = img->width;
         cam->height = img->height;
-        cam->focal = cam->width / (2.0f * tanf(0.6911112070083618 / 2.0f)); // Default camera angle from transforms.json
+        cam->focal = cam->width / (2.0f * tanf(0.6911112070083618 / 2.0f));
         
         dataset->images[dataset->num_images] = img;
         dataset->cameras[dataset->num_images] = cam;
@@ -239,17 +268,17 @@ void free_dataset(Dataset* dataset) {
     }
 }
 
-void generate_ray(Camera* cam, int u, int v, float* ray_o, float* ray_d) {
+void generate_ray(const Camera* cam, int u, int v, float* ray_o, float* ray_d) {
     // Convert pixel coordinates to normalized camera coordinates
     float x = (u - cam->width * 0.5f) / cam->focal;
     float y = -(v - cam->height * 0.5f) / cam->focal;
     float z = -1.0f;
     
-    // Normalize direction
+    // Normalize direction vector
     float norm = sqrtf(x*x + y*y + z*z);
     x /= norm; y /= norm; z /= norm;
     
-    // Transform ray direction by camera rotation
+    // Transform ray direction by camera rotation matrix
     ray_d[0] = cam->rotation[0]*x + cam->rotation[1]*y + cam->rotation[2]*z;
     ray_d[1] = cam->rotation[3]*x + cam->rotation[4]*y + cam->rotation[5]*z;
     ray_d[2] = cam->rotation[6]*x + cam->rotation[7]*y + cam->rotation[8]*z;
@@ -258,48 +287,4 @@ void generate_ray(Camera* cam, int u, int v, float* ray_o, float* ray_d) {
     ray_o[0] = cam->position[0];
     ray_o[1] = cam->position[1];
     ray_o[2] = cam->position[2];
-}
-
-void generate_random_batch(Dataset* dataset, int rays_per_batch, float* batch_X, float* batch_colors) {
-    for (int ray = 0; ray < rays_per_batch; ray++) {
-        // Pick random image
-        int img_idx = rand() % dataset->num_images;
-        Image* img = dataset->images[img_idx];
-        Camera* cam = dataset->cameras[img_idx];
-        
-        // Pick random pixel
-        int u = rand() % cam->width;
-        int v = rand() % cam->height;
-        
-        // Get pixel color (convert from RGBA to RGB and normalize)
-        int pixel_idx = (v * cam->width + u) * 4;  // 4 channels (RGBA)
-        float r_true = img->data[pixel_idx + 0] / 255.0f;
-        float g_true = img->data[pixel_idx + 1] / 255.0f;
-        float b_true = img->data[pixel_idx + 2] / 255.0f;
-        
-        // Generate ray
-        float ray_o[3], ray_d[3];
-        generate_ray(cam, u, v, ray_o, ray_d);
-        
-        // Sample points along the ray
-        for (int sample_idx = 0; sample_idx < NUM_SAMPLES; sample_idx++) {
-            float t = NEAR_PLANE + (FAR_PLANE - NEAR_PLANE) * sample_idx / (NUM_SAMPLES - 1);
-            
-            // 3D position along ray
-            int batch_idx = ray * NUM_SAMPLES + sample_idx;
-            
-            // Input: position + direction (6D)
-            batch_X[batch_idx * 6 + 0] = ray_o[0] + t * ray_d[0];  // x
-            batch_X[batch_idx * 6 + 1] = ray_o[1] + t * ray_d[1];  // y
-            batch_X[batch_idx * 6 + 2] = ray_o[2] + t * ray_d[2];  // z
-            batch_X[batch_idx * 6 + 3] = ray_d[0];                 // dx
-            batch_X[batch_idx * 6 + 4] = ray_d[1];                 // dy
-            batch_X[batch_idx * 6 + 5] = ray_d[2];                 // dz
-            
-            // Ground truth color (same for all samples along this ray)
-            batch_colors[batch_idx * 3 + 0] = r_true;
-            batch_colors[batch_idx * 3 + 1] = g_true;
-            batch_colors[batch_idx * 3 + 2] = b_true;
-        }
-    }
 }
