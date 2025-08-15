@@ -124,8 +124,8 @@ int main() {
     // Training loop
     for (int batch = 0; batch < num_batches; batch++) {
         // Learning rate decay
-        if (batch % 1000 == 0) {
-            learning_rate *= 0.99f;
+        if (batch % 10000 == 0) {
+            learning_rate *= 0.999f;
         }
         
         // Generate training batch
