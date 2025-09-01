@@ -25,7 +25,7 @@ run: train.out
 	@time ./train.out
 
 cont: train.out
-	@time ./train.out $(shell ls -t *_nerf_model.bin 2>/dev/null | head -1)
+	@time ./train.out $(shell ls -t *_nerf_model1.bin 2>/dev/null | head -1) $(shell ls -t *_nerf_model2.bin 2>/dev/null | head -1)
 
 clean:
 	rm -f *.out *.o *_sample.png

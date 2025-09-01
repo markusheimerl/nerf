@@ -88,16 +88,47 @@ int main(int argc, char* argv[]) {
     // Initialize neural networks
     MLP* mlp1;
     MLP* mlp2;
-    if (argc > 1) {
-        // Continue training from existing model - need to implement loading for two MLPs
-        printf("Note: Loading two MLPs not yet implemented, starting new training\n");
-        mlp1 = init_mlp(input_dim, hidden_dim, intermediate_dim, batch_size, cublas_handle);
-        mlp2 = init_mlp(intermediate_dim, hidden_dim, output_dim, batch_size, cublas_handle);
-    } else {
+    if (argc == 3) {
+        // Continue training from existing models
+        printf("Loading existing models:\n");
+        printf("  Model 1: %s\n", argv[1]);
+        printf("  Model 2: %s\n", argv[2]);
+        
+        mlp1 = load_mlp(argv[1], batch_size, cublas_handle);
+        mlp2 = load_mlp(argv[2], batch_size, cublas_handle);
+        
+        if (!mlp1 || !mlp2) {
+            fprintf(stderr, "Failed to load one or both models\n");
+            if (mlp1) free_mlp(mlp1);
+            if (mlp2) free_mlp(mlp2);
+            return -1;
+        }
+        
+        // Verify dimensions match what we expect
+        if (mlp1->input_dim != input_dim || mlp1->output_dim != intermediate_dim ||
+            mlp2->input_dim != intermediate_dim || mlp2->output_dim != output_dim) {
+            fprintf(stderr, "Model dimensions don't match expected architecture\n");
+            fprintf(stderr, "Expected: %d -> %d -> %d -> %d -> %d\n", 
+                    input_dim, hidden_dim, intermediate_dim, hidden_dim, output_dim);
+            fprintf(stderr, "Loaded: %d -> %d -> %d -> %d -> %d\n",
+                    mlp1->input_dim, mlp1->hidden_dim, mlp1->output_dim, 
+                    mlp2->hidden_dim, mlp2->output_dim);
+            free_mlp(mlp1);
+            free_mlp(mlp2);
+            return -1;
+        }
+        
+        printf("Successfully loaded both models (continuing from batch %d)\n", mlp1->t);
+    } else if (argc == 1) {
         // Initialize new models
         printf("Starting new training with two-layer NeRF\n");
         mlp1 = init_mlp(input_dim, hidden_dim, intermediate_dim, batch_size, cublas_handle);
         mlp2 = init_mlp(intermediate_dim, hidden_dim, output_dim, batch_size, cublas_handle);
+    } else {
+        fprintf(stderr, "Usage: %s [model1.bin model2.bin]\n", argv[0]);
+        fprintf(stderr, "  No args: Start new training\n");
+        fprintf(stderr, "  Two args: Continue training from existing models\n");
+        return -1;
     }
     
     // Allocate host memory
