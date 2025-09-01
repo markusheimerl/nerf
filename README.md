@@ -7,5 +7,8 @@ A neural radiance field implementation
 
 ```bash
 sudo apt update
-sudo apt install libpng-dev libjson-c-dev
+sudo apt install clang time libpng-dev libjson-c-dev
+git submodule init
+git submodule update
+make run -j 4
 ```
