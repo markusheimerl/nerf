@@ -2,7 +2,7 @@ CC = clang
 CFLAGS = -O3 -march=native -ffast-math -Wall -Wextra
 LDFLAGS = -lm -flto -lpng -ljson-c
 
-ARCH ?= sm_87
+ARCH ?= sm_86
 CUDAFLAGS = --cuda-gpu-arch=$(ARCH) -x cuda -Wno-unknown-cuda-version
 CUDALIBS = -L/usr/local/cuda/lib64 -lcudart -lcublas
 

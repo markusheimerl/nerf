@@ -41,7 +41,6 @@ int main(int argc, char* argv[]) {
     const int input_dim = pe_input_dim;
     const int hidden_dim = 512;
     const int output_dim = 4;  // density + RGB
-    const int num_layers = 2;
     const int batch_size = rays_per_batch * num_samples;
     
     // Initialize CUDA and cuBLAS
@@ -72,7 +71,7 @@ int main(int argc, char* argv[]) {
     
     // Print calculated configuration
     printf("\nOptimal kernel configuration:\n");
-    printf("  Required shared mem per thread: %d bytes\n", required_shared_mem_per_thread);
+    printf("  Required shared mem per thread: %d\n", required_shared_mem_per_thread);
     printf("  Max threads by shared mem: %d\n", max_threads_by_shared_mem);
     printf("  Chosen ray block size: %d\n", ray_block_size);
     printf("  Number of blocks: %d\n", ray_num_blocks);
@@ -94,7 +93,7 @@ int main(int argc, char* argv[]) {
     } else {
         // Initialize new model
         printf("Starting new training\n");
-        mlp = init_mlp(input_dim, hidden_dim, output_dim, num_layers, batch_size, cublas_handle);
+        mlp = init_mlp(input_dim, hidden_dim, output_dim, batch_size, cublas_handle);
     }
     
     // Allocate host memory
@@ -119,7 +118,7 @@ int main(int argc, char* argv[]) {
     CHECK_CUDA(cudaMalloc(&d_pixel_errors, rays_per_batch * 3 * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_loss_accum, sizeof(float)));
     
-    float* d_mlp_error_output = mlp->d_error_output[mlp->num_layers - 1];
+    float* d_mlp_error_output = mlp->d_error_output;
     
     // Training parameters
     const int num_batches = 2000000;
@@ -127,7 +126,7 @@ int main(int argc, char* argv[]) {
     
     printf("Starting NeRF training with %d batches...\n", num_batches);
     printf("Batch size: %d rays, %d samples per ray\n", rays_per_batch, num_samples);
-    printf("Network: %d -> %d -> %d (%d layers)\n", input_dim, hidden_dim, output_dim, num_layers);
+    printf("Network: %d -> %d -> %d\n", input_dim, hidden_dim, output_dim);
     printf("Positional encoding: pos_L=%d, dir_L=%d, total_dim=%d\n", pos_enc_l, dir_enc_l, pe_input_dim);
     
     // Training loop
@@ -156,9 +155,8 @@ int main(int argc, char* argv[]) {
         // Apply activation functions and extract densities/colors
         int block_size = 256;
         int num_blocks = (batch_size + block_size - 1) / block_size;
-        int last_layer = mlp->num_layers - 1;
         activation_kernel<<<num_blocks, block_size>>>(
-            mlp->d_layer_output[last_layer], d_densities, d_colors, batch_size, output_dim);
+            mlp->d_layer_output, d_densities, d_colors, batch_size, output_dim);
         
         // Zero gradients
         zero_gradients_mlp(mlp);
@@ -177,7 +175,7 @@ int main(int argc, char* argv[]) {
             d_mlp_error_output, rays_per_batch, num_samples);
         
         // Backward pass and weight update
-        backward_pass_mlp(mlp, d_batch_PE_X);
+        backward_pass_mlp(mlp, d_batch_PE_X, NULL);
         update_weights_mlp(mlp, learning_rate);
         
         // Print progress and render test images

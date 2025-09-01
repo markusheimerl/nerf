@@ -228,20 +228,13 @@ void render_test_image(void* mlp_ptr, const Dataset* dataset, int batch_num, voi
     generate_interpolated_camera(dataset, &novel_cam);
 
     // Create temporary MLP for rendering with single sample batch
-    MLP* temp_mlp = init_mlp(mlp->input_dim, mlp->hidden_dim, mlp->output_dim, mlp->num_layers, num_samples, cublas_handle);
+    MLP* temp_mlp = init_mlp(mlp->input_dim, mlp->hidden_dim, mlp->output_dim, num_samples, cublas_handle);
     
     // Copy weights from trained model
-    for (int layer = 0; layer < mlp->num_layers; layer++) {
-        int input_size = (layer == 0) ? mlp->input_dim : mlp->hidden_dim;
-        int output_size = (layer == mlp->num_layers - 1) ? mlp->output_dim : mlp->hidden_dim;
-        
-        cudaMemcpy(temp_mlp->d_W1[layer], mlp->d_W1[layer], 
-                   mlp->hidden_dim * input_size * sizeof(float), cudaMemcpyDeviceToDevice);
-        cudaMemcpy(temp_mlp->d_W2[layer], mlp->d_W2[layer], 
-                   output_size * mlp->hidden_dim * sizeof(float), cudaMemcpyDeviceToDevice);
-        cudaMemcpy(temp_mlp->d_W3[layer], mlp->d_W3[layer], 
-                   output_size * input_size * sizeof(float), cudaMemcpyDeviceToDevice);
-    }
+    cudaMemcpy(temp_mlp->d_W1, mlp->d_W1, 
+               mlp->hidden_dim * mlp->input_dim * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(temp_mlp->d_W2, mlp->d_W2, 
+               mlp->output_dim * mlp->hidden_dim * sizeof(float), cudaMemcpyDeviceToDevice);
 
     // Allocate host memory
     float* ray_X = (float*)malloc(num_samples * 6 * sizeof(float));
@@ -286,9 +279,8 @@ void render_test_image(void* mlp_ptr, const Dataset* dataset, int batch_num, voi
             // Apply activation functions and extract densities/colors directly
             int block_size = 64;
             int num_blocks = (num_samples + block_size - 1) / block_size;
-            int last_layer = temp_mlp->num_layers - 1;
             activation_kernel<<<num_blocks, block_size>>>(
-                temp_mlp->d_layer_output[last_layer], d_densities, d_colors, num_samples, temp_mlp->output_dim);
+                temp_mlp->d_layer_output, d_densities, d_colors, num_samples, temp_mlp->output_dim);
 
             // Copy results back to host
             float* densities = (float*)malloc(num_samples * sizeof(float));
