@@ -40,6 +40,7 @@ int main(int argc, char* argv[]) {
     // Network parameters
     const int input_dim = pe_input_dim;
     const int hidden_dim = 512;
+    const int intermediate_dim = 512;  // Output of first MLP
     const int output_dim = 4;  // density + RGB
     const int batch_size = rays_per_batch * num_samples;
     
@@ -84,16 +85,19 @@ int main(int argc, char* argv[]) {
     CHECK_CUBLAS(cublasCreate(&cublas_handle));
     CHECK_CUBLAS(cublasSetMathMode(cublas_handle, CUBLAS_TENSOR_OP_MATH));
     
-    // Initialize neural network
-    MLP* mlp;
+    // Initialize neural networks
+    MLP* mlp1;
+    MLP* mlp2;
     if (argc > 1) {
-        // Continue training from existing model
-        printf("Loading existing model: %s\n", argv[1]);
-        mlp = load_mlp(argv[1], batch_size, cublas_handle);
+        // Continue training from existing model - need to implement loading for two MLPs
+        printf("Note: Loading two MLPs not yet implemented, starting new training\n");
+        mlp1 = init_mlp(input_dim, hidden_dim, intermediate_dim, batch_size, cublas_handle);
+        mlp2 = init_mlp(intermediate_dim, hidden_dim, output_dim, batch_size, cublas_handle);
     } else {
-        // Initialize new model
-        printf("Starting new training\n");
-        mlp = init_mlp(input_dim, hidden_dim, output_dim, batch_size, cublas_handle);
+        // Initialize new models
+        printf("Starting new training with two-layer NeRF\n");
+        mlp1 = init_mlp(input_dim, hidden_dim, intermediate_dim, batch_size, cublas_handle);
+        mlp2 = init_mlp(intermediate_dim, hidden_dim, output_dim, batch_size, cublas_handle);
     }
     
     // Allocate host memory
@@ -118,7 +122,7 @@ int main(int argc, char* argv[]) {
     CHECK_CUDA(cudaMalloc(&d_pixel_errors, rays_per_batch * 3 * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_loss_accum, sizeof(float)));
     
-    float* d_mlp_error_output = mlp->d_error_output;
+    float* d_mlp_error_output = mlp2->d_error_output;
     
     // Training parameters
     const int num_batches = 2000000;
@@ -126,11 +130,11 @@ int main(int argc, char* argv[]) {
     
     printf("Starting NeRF training with %d batches...\n", num_batches);
     printf("Batch size: %d rays, %d samples per ray\n", rays_per_batch, num_samples);
-    printf("Network: %d -> %d -> %d\n", input_dim, hidden_dim, output_dim);
+    printf("Network: %d -> %d -> %d -> %d -> %d\n", input_dim, hidden_dim, intermediate_dim, hidden_dim, output_dim);
     printf("Positional encoding: pos_L=%d, dir_L=%d, total_dim=%d\n", pos_enc_l, dir_enc_l, pe_input_dim);
     
     // Training loop
-    int starting_batch = mlp->t;
+    int starting_batch = mlp1->t;
     for (int batch = starting_batch; batch < starting_batch + num_batches; batch++) {
         // Learning rate decay
         if (batch % 10000 == 0) {
@@ -149,17 +153,19 @@ int main(int argc, char* argv[]) {
         CHECK_CUDA(cudaMemcpy(d_batch_true_colors, batch_true_colors, 
                              batch_size * 3 * sizeof(float), cudaMemcpyHostToDevice));
         
-        // Forward pass
-        forward_pass_mlp(mlp, d_batch_PE_X);
+        // Forward pass through both MLPs
+        forward_pass_mlp(mlp1, d_batch_PE_X);
+        forward_pass_mlp(mlp2, mlp1->d_layer_output);
         
-        // Apply activation functions and extract densities/colors
+        // Apply activation functions and extract densities/colors from final MLP
         int block_size = 256;
         int num_blocks = (batch_size + block_size - 1) / block_size;
         activation_kernel<<<num_blocks, block_size>>>(
-            mlp->d_layer_output, d_densities, d_colors, batch_size, output_dim);
+            mlp2->d_layer_output, d_densities, d_colors, batch_size, output_dim);
         
-        // Zero gradients
-        zero_gradients_mlp(mlp);
+        // Zero gradients for both MLPs
+        zero_gradients_mlp(mlp1);
+        zero_gradients_mlp(mlp2);
         
         // Volume rendering and loss computation
         CHECK_CUDA(cudaMemset(d_loss_accum, 0, sizeof(float)));
@@ -174,9 +180,13 @@ int main(int argc, char* argv[]) {
             d_densities, d_colors, d_pixel_errors,
             d_mlp_error_output, rays_per_batch, num_samples);
         
-        // Backward pass and weight update
-        backward_pass_mlp(mlp, d_batch_PE_X, NULL);
-        update_weights_mlp(mlp, learning_rate);
+        // Backward pass through both MLPs
+        backward_pass_mlp(mlp2, mlp1->d_layer_output, mlp1->d_error_output);
+        backward_pass_mlp(mlp1, d_batch_PE_X, NULL);
+        
+        // Update weights for both MLPs
+        update_weights_mlp(mlp1, learning_rate);
+        update_weights_mlp(mlp2, learning_rate);
         
         // Print progress and render test images
         if ((batch + 1) % 100 == 0) {
@@ -188,27 +198,30 @@ int main(int argc, char* argv[]) {
                    batch + 1, starting_batch + num_batches, total_loss, learning_rate);
             
             if ((batch + 1) % 5000 == 0) {
-                render_test_image(mlp, dataset, batch + 1, cublas_handle,
+                render_test_image(mlp1, mlp2, dataset, batch + 1, cublas_handle,
                                 num_samples, near_plane, far_plane, pos_enc_l, dir_enc_l,
                                 pe_input_dim, render_width, render_height);
             }
         }
     }
     
-    // Save trained model
-    char model_filename[64];
+    // Save trained models
+    char model1_filename[64], model2_filename[64];
     time_t now = time(NULL);
-    strftime(model_filename, sizeof(model_filename), "%Y%m%d_%H%M%S_nerf_model.bin", localtime(&now));
-    save_mlp(mlp, model_filename);
+    strftime(model1_filename, sizeof(model1_filename), "%Y%m%d_%H%M%S_nerf_model1.bin", localtime(&now));
+    strftime(model2_filename, sizeof(model2_filename), "%Y%m%d_%H%M%S_nerf_model2.bin", localtime(&now));
+    save_mlp(mlp1, model1_filename);
+    save_mlp(mlp2, model2_filename);
     
-    printf("\nTraining completed! Model saved to: %s\n", model_filename);
+    printf("\nTraining completed! Models saved to: %s and %s\n", model1_filename, model2_filename);
     
     // Cleanup
     free_dataset(dataset);
     free(batch_X);
     free(batch_PE_X);
     free(batch_true_colors);
-    free_mlp(mlp);
+    free_mlp(mlp1);
+    free_mlp(mlp2);
     
     CHECK_CUDA(cudaFree(d_batch_PE_X));
     CHECK_CUDA(cudaFree(d_batch_true_colors));

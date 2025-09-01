@@ -216,10 +216,11 @@ void generate_interpolated_camera(const Dataset* dataset, Camera* out_cam) {
     interpolate_cameras(dataset->cameras[cam_a_idx], dataset->cameras[cam_b_idx], alpha, out_cam);
 }
 
-void render_test_image(void* mlp_ptr, const Dataset* dataset, int batch_num, void* cublas_handle_ptr,
+void render_test_image(void* mlp1_ptr, void* mlp2_ptr, const Dataset* dataset, int batch_num, void* cublas_handle_ptr,
                       int num_samples, float near_plane, float far_plane, int pos_enc_l, int dir_enc_l,
                       int pe_input_dim, int render_width, int render_height) {
-    MLP* mlp = (MLP*)mlp_ptr;
+    MLP* mlp1 = (MLP*)mlp1_ptr;
+    MLP* mlp2 = (MLP*)mlp2_ptr;
     cublasHandle_t cublas_handle = (cublasHandle_t)cublas_handle_ptr;
     
     printf("  Rendering test image %dx%d with interpolated view...\n", render_width, render_height);
@@ -227,14 +228,19 @@ void render_test_image(void* mlp_ptr, const Dataset* dataset, int batch_num, voi
     Camera novel_cam;
     generate_interpolated_camera(dataset, &novel_cam);
 
-    // Create temporary MLP for rendering with single sample batch
-    MLP* temp_mlp = init_mlp(mlp->input_dim, mlp->hidden_dim, mlp->output_dim, num_samples, cublas_handle);
+    // Create temporary MLPs for rendering with single sample batch
+    MLP* temp_mlp1 = init_mlp(mlp1->input_dim, mlp1->hidden_dim, mlp1->output_dim, num_samples, cublas_handle);
+    MLP* temp_mlp2 = init_mlp(mlp2->input_dim, mlp2->hidden_dim, mlp2->output_dim, num_samples, cublas_handle);
     
-    // Copy weights from trained model
-    cudaMemcpy(temp_mlp->d_W1, mlp->d_W1, 
-               mlp->hidden_dim * mlp->input_dim * sizeof(float), cudaMemcpyDeviceToDevice);
-    cudaMemcpy(temp_mlp->d_W2, mlp->d_W2, 
-               mlp->output_dim * mlp->hidden_dim * sizeof(float), cudaMemcpyDeviceToDevice);
+    // Copy weights from trained models
+    cudaMemcpy(temp_mlp1->d_W1, mlp1->d_W1, 
+               mlp1->hidden_dim * mlp1->input_dim * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(temp_mlp1->d_W2, mlp1->d_W2, 
+               mlp1->output_dim * mlp1->hidden_dim * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(temp_mlp2->d_W1, mlp2->d_W1, 
+               mlp2->hidden_dim * mlp2->input_dim * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(temp_mlp2->d_W2, mlp2->d_W2, 
+               mlp2->output_dim * mlp2->hidden_dim * sizeof(float), cudaMemcpyDeviceToDevice);
 
     // Allocate host memory
     float* ray_X = (float*)malloc(num_samples * 6 * sizeof(float));
@@ -270,17 +276,18 @@ void render_test_image(void* mlp_ptr, const Dataset* dataset, int batch_num, voi
                 ray_X[s * 6 + 5] = ray_d[2];
             }
             
-            // Apply positional encoding and run inference
+            // Apply positional encoding and run inference through both MLPs
             batch_positional_encoding(ray_X, num_samples, 1, ray_PE_X, pos_enc_l, dir_enc_l, pe_input_dim);
             cudaMemcpy(d_ray_PE_X, ray_PE_X, num_samples * pe_input_dim * sizeof(float), cudaMemcpyHostToDevice);
 
-            forward_pass_mlp(temp_mlp, d_ray_PE_X);
+            forward_pass_mlp(temp_mlp1, d_ray_PE_X);
+            forward_pass_mlp(temp_mlp2, temp_mlp1->d_layer_output);
 
-            // Apply activation functions and extract densities/colors directly
+            // Apply activation functions and extract densities/colors from final MLP
             int block_size = 64;
             int num_blocks = (num_samples + block_size - 1) / block_size;
             activation_kernel<<<num_blocks, block_size>>>(
-                temp_mlp->d_layer_output, d_densities, d_colors, num_samples, temp_mlp->output_dim);
+                temp_mlp2->d_layer_output, d_densities, d_colors, num_samples, temp_mlp2->output_dim);
 
             // Copy results back to host
             float* densities = (float*)malloc(num_samples * sizeof(float));
@@ -328,7 +335,8 @@ void render_test_image(void* mlp_ptr, const Dataset* dataset, int batch_num, voi
     free(image_data);
     free(ray_X);
     free(ray_PE_X);
-    free_mlp(temp_mlp);
+    free_mlp(temp_mlp1);
+    free_mlp(temp_mlp2);
     cudaFree(d_ray_PE_X);
     cudaFree(d_densities);
     cudaFree(d_colors);

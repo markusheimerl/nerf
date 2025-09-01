@@ -25,7 +25,7 @@ void batch_positional_encoding(const float* batch_X, int num_samples, int rays_p
 void generate_random_batch(const Dataset* dataset, int rays_per_batch, int num_samples,
                          float near_plane, float far_plane, float* batch_X, float* batch_colors);
 void generate_interpolated_camera(const Dataset* dataset, Camera* out_cam);
-void render_test_image(void* mlp_ptr, const Dataset* dataset, int batch_num, void* cublas_handle_ptr,
+void render_test_image(void* mlp1_ptr, void* mlp2_ptr, const Dataset* dataset, int batch_num, void* cublas_handle_ptr,
                       int num_samples, float near_plane, float far_plane, int pos_enc_l, int dir_enc_l,
                       int pe_input_dim, int render_width, int render_height);
 
